@@ -3750,3 +3750,49 @@ model StockJournalLine {
   @@index([ingredientId])
   @@map("stock_journal_lines")
 }
+model MyDataReceipt {
+  id                String   @id @default(uuid())
+  orderId           String   // not @unique — a cancel creates a second record
+  orderNumber       String
+  branchId          String
+  receiptCase       BigInt   @default(0)  // GR POS receipt v2 = 0x4752200000000001
+  amounts           String                  // JSON array of FtAmount
+  chargeItems       String                  // JSON array of FtChargeItem
+  payItems          String                  // JSON array of FtPayItem
+  tableArea         String?                 // Table number for restaurant orders (8.6)
+  totalAmount       Decimal
+  status            MyDataReceiptStatus @default(PENDING)
+  sandbox           Boolean  @default(false)
+  // Original receipt moment — stored at checkout time, reused for submission
+  // so the Belegzeitstempel doesn't drift on retry.
+  cbReceiptMoment   DateTime @default(now())
+  // Filled after successful submission to CloudCashbox → myDATA
+  mark              String?                 // invoiceMark (AADE registration number)
+  uid               String?                 // invoiceUid (myDATA hash)
+  authenticationCode String?                // Verification code
+  uniqueDocumentIdentifier String?          // Μοναδικός αριθμός παραστατικού
+  qrCodeUrl         String?                 // PosReceipt signature (001) — QR code URL
+  ftReceiptNumber   Int?
+  ftTimestamp       DateTime?
+  ftHash            String?
+  transmissionFailure Boolean @default(false) // (016) — connection loss flag
+  providerFooter    String?                 // (011) — provider legal name (Route 1 only)
+  submittedAt       DateTime?
+  // Cancellation
+  cancelMark        String?
+  cancelledAt       DateTime?
+  // Retry tracking (sendPending increments on failure, moves to FAILED after MAX_RETRIES)
+  retryCount        Int      @default(0)
+  lastError         String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  @@index([branchId, status])
+  @@index([orderId, createdAt])
+  @@index([createdAt])
+}
+enum MyDataReceiptStatus {
+  PENDING     // Created, not yet sent to CloudCashbox SaaS
+  SUBMITTED   // Successfully submitted, MARK received
+  FAILED      // Submission failed permanently (after max retries)
+  CANCELLED   // Cancelled via CancelInvoice at myDATA
+}
