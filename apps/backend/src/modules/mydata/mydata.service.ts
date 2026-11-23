@@ -268,7 +268,10 @@ export class MyDataService {
         headers: this.authHeaders(),
         signal: AbortSignal.timeout(5_000),
       });
-      return res.status >= 200 && res.status < 300;
+      // Any HTTP response proves reachability — the sandbox has no /health
+      // route and answers 404, which is a successful round-trip, not an
+      // outage. Only transport errors (thrown below) mean unreachable.
+      return res.status < 500;
     } catch {
       // Fallback: GET auf die Basis-URL
       try {
