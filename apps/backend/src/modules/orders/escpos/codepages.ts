@@ -1,9 +1,9 @@
-// Generated from Python's cp437/cp850/cp858/cp1252 codecs (bytes 0x80-0xFF).
+// Generated from Python's cp437/cp850/cp858/cp1252/cp1253 codecs (bytes 0x80-0xFF).
 // U+FFFD marks bytes the code page leaves undefined. Bytes 0x00-0x7F are ASCII in all of them.
 // `escposTable` is the ESC t n selector for Epson-compatible printers; some
 // clone printers number their code pages differently - verify on the real unit.
 
-export type CodepageName = 'CP437' | 'CP850' | 'CP858' | 'CP1252';
+export type CodepageName = 'CP437' | 'CP850' | 'CP858' | 'CP1252' | 'CP1253';
 
 export const CODEPAGES: Record<
   CodepageName,
@@ -24,5 +24,11 @@ export const CODEPAGES: Record<
   CP1252: {
     escposTable: 16,
     high: '€�‚ƒ„…†‡ˆ‰Š‹Œ�Ž��‘’“”•–—˜™š›œ�žŸ ¡¢£¤¥¦§¨©ª«¬­®¯°±²³´µ¶·¸¹º»¼½¾¿ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿ',
+  },
+  CP1253: {
+    // Epson ESC t 47 = WPC1253 (Greek). Not every clone honours the numbering,
+    // so a test print on the real unit is still required (see file header).
+    escposTable: 47,
+    high: '€�‚ƒ„…†‡�‰�‹�����‘’“”•–—�™�›���� ΅Ά£¤¥¦§¨©�«¬­®―°±²³΄µ¶·ΈΉΊ»Ό½ΎΏΐΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡ�ΣΤΥΦΧΨΩΪΫάέήίΰαβγδεζηθικλμνξοπρςστυφχψωϊϋόύώ�',
   },
 };

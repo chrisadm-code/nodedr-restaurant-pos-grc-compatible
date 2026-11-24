@@ -69,6 +69,7 @@ import { OrdersDuesService, type DuesStatus } from './orders-dues.service';
 import { buildKotHtml } from './kot.html';
 import { buildReceiptHtml } from './receipt.html';
 import { VerifactuService } from '../verifactu/verifactu.service';
+import { MyDataService } from '../mydata/mydata.service';
 
 type ReceiptData = Awaited<ReturnType<OrdersService['getReceiptData']>>;
 
@@ -206,6 +207,7 @@ export class OrdersController {
     private readonly branchAccess: BranchAccessService,
     private readonly kotPrint: KotPrintService,
     private readonly verifactu: VerifactuService,
+    private readonly mydata: MyDataService,
     private readonly billShare: BillShareService,
     private readonly dues: OrdersDuesService,
   ) {}
@@ -544,6 +546,9 @@ export class OrdersController {
         verifactu: overrides.isProvisional
           ? null
           : await this.verifactu.qrForOrder(order.id),
+        mydata: overrides.isProvisional
+          ? null
+          : await this.mydata.getReceiptData(order.id),
         upi: upiFor(order, overrides),
       },
     });
@@ -767,6 +772,9 @@ export class OrdersController {
         verifactu: overrides.isProvisional
           ? null
           : await this.verifactu.qrForOrder(order.id),
+        mydata: overrides.isProvisional
+          ? null
+          : await this.mydata.getReceiptData(order.id),
         upi: upiFor(order, overrides),
       },
       profile,

@@ -33,7 +33,7 @@ public class MainActivity extends BridgeActivity {
             } catch (JSONException ignored) {}
             this.config = new CapConfig.Builder(this)
                 .setServerUrl(server)
-                .setAllowNavigation(new String[] { "*" })
+                .setAllowNavigation(allowedNavigation(server, this))
                 .setAndroidScheme("https")
                 .setAllowMixedContent(true)
                 .setErrorPath("offline.html")
@@ -163,6 +163,47 @@ public class MainActivity extends BridgeActivity {
     }
 
     private android.net.ConnectivityManager.NetworkCallback networkCallback;
+
+    /**
+     * Hosts the app WebView may stay on.
+     *
+     * This used to be a wildcard ("*"). The Capacitor bridge is injected into
+     * every page the WebView loads from the server origin, and that bridge hands
+     * the page native capabilities (Bluetooth printing, saving files, push). With
+     * a wildcard, any link the web app followed - a mis-typed address, a
+     * compromised coupon redirect, a payment return URL - would run with those
+     * capabilities. The allowlist is therefore built from the addresses the user
+     * actually configured: the same server they are signed in to.
+     *
+     * Payment pages do not depend on this: they leave the WebView through the
+     * OrderRestroNative.openExternal bridge, which only ever sends https links to
+     * the phone's own browser. If a flow still navigates in place and is refused
+     * here, opening outside the app is the intended result.
+     */
+    private static String[] allowedNavigation(String server, android.content.Context ctx) {
+        java.util.LinkedHashSet<String> hosts = new java.util.LinkedHashSet<>();
+        for (String candidate : new String[] {
+            server,
+            ServerLinkPlugin.local(ctx),
+            ServerLinkPlugin.external(ctx),
+        }) {
+            String h = hostOf(candidate);
+            if (h != null && !h.isEmpty()) hosts.add(h);
+        }
+        hosts.add("localhost");
+        hosts.add("127.0.0.1");
+        return hosts.toArray(new String[0]);
+    }
+
+    /** Hostname of an http(s) address, or null when it is not one. */
+    private static String hostOf(String url) {
+        if (url == null || url.isEmpty()) return null;
+        try {
+            return java.net.URI.create(url).getHost();
+        } catch (Exception e) {
+            return null;
+        }
+    }
 
     /**
      * With both a local and an online address saved, move to the better one when

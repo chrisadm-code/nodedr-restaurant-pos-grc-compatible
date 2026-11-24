@@ -8,6 +8,7 @@ import { InventoryModule } from '../inventory/inventory.module';
 import { MarketingModule } from '../marketing/marketing.module';
 import { ReferralsModule } from '../referrals/referrals.module';
 import { VerifactuModule } from '../verifactu/verifactu.module';
+import { MyDataModule } from '../mydata/mydata.module';
 import { KotPrintService } from './kot-print.service';
 import { OrdersController } from './orders.controller';
 import { OrdersDuesService } from './orders-dues.service';
@@ -22,6 +23,7 @@ import { ScheduledOrdersService } from './scheduled-orders.service';
     NotificationsModule,
     MarketingModule,
     VerifactuModule,
+    MyDataModule,
     ReferralsModule,
     BillShareModule,
   ],

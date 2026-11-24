@@ -306,6 +306,16 @@ export class MyDataService {
   async recordPaidOrder(tx: Tx, orderId: string): Promise<void> {
     if (!this.isEnabled) return;
 
+    // Idempotent: the same order must not get a second fiscal record. A retried
+    // checkout or a replayed request can reach here again; a cancel is the only
+    // thing that legitimately adds a second row (status CANCELLED), so those are
+    // excluded from the duplicate check rather than skipping the whole order.
+    const existing = await tx.myDataReceipt.findFirst({
+      where: { orderId, status: { not: 'CANCELLED' } },
+      select: { id: true },
+    });
+    if (existing) return;
+
     const order = await tx.order.findUniqueOrThrow({
       where: { id: orderId },
       include: {

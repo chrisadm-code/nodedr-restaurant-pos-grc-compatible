@@ -15,6 +15,7 @@
 
 import { qrSvg } from '../verifactu/verifactu.qr';
 import type { ReceiptVerifactu } from './escpos-receipt';
+import type { ReceiptMyData } from '../mydata/mydata.service';
 import {
   resolveTaxIdLabel,
   resolveTaxLabel,
@@ -45,6 +46,8 @@ interface ReceiptOrder {
   upi?: { uri: string; amountText: string; payee: string | null } | null;
   /** Spain VERI*FACTU invoice QR, printed on a paid receipt. */
   verifactu?: ReceiptVerifactu | null;
+  /** Greece myDATA (AADE) MARK + QR, printed on a paid receipt. */
+  mydata?: ReceiptMyData | null;
   orderNumber: string;
   type: string;
   createdAt: Date;
@@ -274,6 +277,11 @@ export function buildReceiptHtml({
     ${
       order.verifactu && !order.isProvisional
         ? `<hr class="rule"><div class="vf"><strong>Factura simplificada ${esc(order.verifactu.invoiceNumber)}</strong><div>${esc(order.verifactu.heading)}</div>${qrSvg(order.verifactu.url, '35mm')}<div>${esc(order.verifactu.legend)}</div><strong>${esc(order.verifactu.short)}</strong></div>`
+        : ''
+    }
+    ${
+      order.mydata?.mark && !order.isProvisional
+        ? `<hr class="rule"><div class="vf"><strong>ΑΠΟΔΕΙΞΗ ΛΙΑΝΙΚΗΣ ΠΩΛΗΣΗΣ</strong>${order.mydata.uniqueDocumentIdentifier ? `<div>Μοναδικός Αρ.: ${esc(order.mydata.uniqueDocumentIdentifier)}</div>` : ''}<div><strong>MARK: ${esc(order.mydata.mark)}</strong></div>${order.mydata.qrCodeUrl ? qrSvg(order.mydata.qrCodeUrl, '35mm') : ''}${order.mydata.authenticationCode ? `<div>Auth: ${esc(order.mydata.authenticationCode)}</div>` : ''}${order.mydata.transmissionFailure ? `<div><strong>Απώλεια Διασύνδεσης Οντότητας - Παρόχου</strong></div>` : ''}${order.mydata.providerFooter ? `<div>${esc(order.mydata.providerFooter)}</div>` : ''}${order.mydata.sandbox ? `<div><strong>** TEST (Sandbox) **</strong></div>` : ''}</div>`
         : ''
     }
     ${

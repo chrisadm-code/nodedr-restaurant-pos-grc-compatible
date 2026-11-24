@@ -1576,6 +1576,16 @@ enum OrderStatus {
   CANCELLED
 }
 
+// How much of a dish a line is, when the item has a half portion or staff
+// typed their own price. Kept as an enum (not a free string) so a typo or a
+// bad import cannot put an unshowable portion on a paid, fiscalised bill.
+// CUSTOM is staff-only and always carries customPrice (see orders.service).
+enum OrderPortion {
+  HALF
+  FULL
+  CUSTOM
+}
+
 // Where an order/reservation came from: staff at the POS/phone (STAFF) or a
 // guest through the website / QR (ONLINE). Drives the Online vs Offline
 // split in the dashboard. Separate from OrderType (dine-in/takeaway/...),
@@ -1766,7 +1776,7 @@ model OrderItem {
   // item's halfPortionRatio, else 1), frozen when the sale was paid. The production COST of the
   // line lives in OrderItemCost, a separate table, because order rows are returned to waiters,
   // kiosks and customers and a cost must never travel with them.
-  portion      String? // HALF | FULL | CUSTOM as ordered; null for plain items
+  portion      OrderPortion? // null for plain items
   portionRatio Decimal        @default(1) @db.Decimal(5, 3)
   cost         OrderItemCost?
 

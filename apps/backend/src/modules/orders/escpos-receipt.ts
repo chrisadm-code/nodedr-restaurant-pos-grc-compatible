@@ -16,6 +16,7 @@ import {
   type TaxMode,
   type TaxRegime,
 } from '@nodedr-restaurant/types';
+import type { ReceiptMyData } from '../mydata/mydata.service';
 import {
   CMD,
   EscposWriter,
@@ -61,6 +62,8 @@ export interface EscposReceiptOrder {
   upi?: { uri: string; amountText: string; payee: string | null } | null;
   /** Spain VERI*FACTU invoice QR, printed on a paid receipt. */
   verifactu?: ReceiptVerifactu | null;
+  /** Greece myDATA (AADE) MARK + QR, printed on a paid receipt. */
+  mydata?: ReceiptMyData | null;
   orderNumber: string;
   type: string;
   createdAt: Date;
@@ -247,6 +250,48 @@ export function buildReceiptEscPosJob({
     w.qr(order.verifactu.url);
     w.text(order.verifactu.legend, { align: 'center' });
     w.text(order.verifactu.short, { align: 'center', bold: true });
+  }
+
+  // Greece myDATA (AADE): the MARK is the fiscal registration number the guest
+  // needs; the QR points at the digital receipt on the AADE/myDATA portal.
+  // Printed only on a paid, non-provisional receipt, like the Spanish block.
+  if (order.mydata?.mark && !order.isProvisional) {
+    // The Greek labels below only render on a Greek code page (CP1253). On any
+    // other page they would print as "?", which is not acceptable on a legal
+    // receipt, so fall back to a Latin equivalent rather than emit garbage.
+    const greek = w.has('Α') && w.has('Π') && w.has('Ξ');
+    w.rule();
+    w.text(greek ? 'ΑΠΟΔΕΙΞΗ ΛΙΑΝΙΚΗΣ ΠΩΛΗΣΗΣ' : 'RETAIL RECEIPT (GR)', {
+      align: 'center',
+      bold: true,
+    });
+    if (order.mydata.uniqueDocumentIdentifier) {
+      w.text(
+        `${greek ? 'Μοναδικός Αρ.' : 'Document no.'}: ${order.mydata.uniqueDocumentIdentifier}`,
+        { align: 'center' },
+      );
+    }
+    w.text(`MARK: ${order.mydata.mark}`, { align: 'center', bold: true });
+    if (order.mydata.qrCodeUrl) w.qr(order.mydata.qrCodeUrl);
+    if (order.mydata.authenticationCode) {
+      w.text(`Auth: ${order.mydata.authenticationCode}`, { align: 'center' });
+    }
+    // A transmission failure means the receipt reached us but NOT myDATA yet:
+    // the law requires the notice on the printed copy.
+    if (order.mydata.transmissionFailure) {
+      w.text(
+        greek
+          ? 'Απώλεια Διασύνδεσης Οντότητας - Παρόχου'
+          : 'TRANSMISSION FAILURE - ENTITY/PROVIDER',
+        { align: 'center', bold: true },
+      );
+    }
+    if (order.mydata.providerFooter) {
+      w.text(order.mydata.providerFooter, { align: 'center' });
+    }
+    if (order.mydata.sandbox) {
+      w.text('** TEST (Sandbox) **', { align: 'center', bold: true });
+    }
   }
 
   if (order.upi && order.isProvisional) {

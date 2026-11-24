@@ -64,9 +64,15 @@ if [ ! -f .env ]; then
     pg_password="$(openssl rand -hex 16)"
     updater_token="$(openssl rand -hex 24)"
   else
-    jwt_secret="$(head -c48 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c64)"
-    pg_password="$(head -c24 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c32)"
-    updater_token="$(head -c32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c48)"
+    # `base64 | tr -dc | head -c64` could not deliver the length it promised:
+    # base64 of 48 bytes is 64 characters, but only ~61 of them are
+    # alphanumeric, so after tr -dc the pipe ran dry and head -c64 returned
+    # 60-64 characters. Secrets shorter than intended, silently. `od -tx1`
+    # always yields exactly 2 hex characters per byte, so the length is
+    # exact and the format matches the openssl branch above.
+    jwt_secret="$(od -An -tx1 -N32 /dev/urandom | tr -d ' \n')"
+    pg_password="$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')"
+    updater_token="$(od -An -tx1 -N24 /dev/urandom | tr -d ' \n')"
   fi
   cat > .env <<EOF
 POSTGRES_PASSWORD=${pg_password}

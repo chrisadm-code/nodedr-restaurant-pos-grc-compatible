@@ -380,6 +380,117 @@ describe('VERI*FACTU QR on the receipt', () => {
   });
 });
 
+describe('myDATA (Greece) block on the receipt', () => {
+  const mydata: import('../mydata/mydata.service').ReceiptMyData = {
+    qrCodeUrl: 'https://www1.aade.gr/webtax/synallassontesQR?id=123&mark=400001234567890',
+    mark: '400001234567890',
+    uid: 'ABCDEF1234567890',
+    authenticationCode: 'A1B2C3',
+    uniqueDocumentIdentifier: 'GR-2026-42',
+    receiptNumber: 42,
+    timestamp: '2026-10-18T10:30:05Z',
+    hash: 'hash',
+    transmissionFailure: false,
+    providerFooter: null,
+    sandbox: false,
+  };
+  // A Greek branch: EUR currency and CP1253 so the Greek labels are printable.
+  const greekBranch = { ...branch, taxRegime: 'ES_IVA' as const };
+  const job = (
+    o: typeof order & { isProvisional?: boolean },
+    md: typeof mydata | null = mydata,
+    codepage: 'CP1253' | 'CP858' = 'CP1253',
+  ) =>
+    buildReceiptEscPosJob({
+      restaurantName: 'Ταβέρνα',
+      currency: 'EUR',
+      branch: greekBranch,
+      order: { ...o, mydata: md },
+      profile: resolveProfile({ paperWidthMm: 80, codepage }),
+      ...fmt,
+    });
+
+  it('prints the MARK and a native QR on a paid receipt', () => {
+    const { buffer } = job(order);
+    const text = buffer.toString('latin1');
+    expect(text).toContain('MARK: 400001234567890');
+    // native QR command present
+    expect(buffer.includes(Buffer.from([0x1d, 0x28, 0x6b]))).toBe(true);
+    // the QR payload is the AADE url, not the VERI*FACTU one
+    expect(buffer.includes(Buffer.from(mydata.qrCodeUrl))).toBe(true);
+  });
+
+  it('prints the Greek heading when the printer is on a Greek code page', () => {
+    const { text } = readJob(job(order).buffer, 'CP1253');
+    expect(text).toContain('ΑΠΟΔΕΙΞΗ');
+    expect(text).toContain('Μοναδικός');
+  });
+
+  it('falls back to Latin labels on a non-Greek code page instead of printing "?"', () => {
+    const { text } = readJob(job(order, mydata, 'CP858').buffer, 'CP858');
+    expect(text).toContain('RETAIL RECEIPT (GR)');
+    expect(text).toContain('Document no.: GR-2026-42');
+    // The fiscal block itself must carry no unprintable characters. The block
+    // runs from the heading to the auth code; only that slice is asserted, so
+    // an unprintable restaurant name elsewhere on the receipt is irrelevant.
+    // A literal '?' is not a valid signal here: the QR payload is a URL and
+    // legitimately contains '?'. What must be absent is the Greek label text
+    // leaking through as substitute characters.
+    const fiscal = text.slice(
+      text.indexOf('RETAIL RECEIPT (GR)'),
+      text.indexOf('Auth:'),
+    );
+    expect(fiscal).not.toContain('ΑΠΟΔΕ');
+    expect(fiscal).not.toContain('\ufffd');
+  });
+
+  it('prints the mandatory transmission-failure notice', () => {
+    const { text } = readJob(
+      job(order, { ...mydata, transmissionFailure: true }).buffer,
+      'CP1253',
+    );
+    expect(text).toContain('Απώλεια Διασύνδεσης');
+  });
+
+  it('prints a Latin failure notice when the code page has no Greek', () => {
+    const { text } = readJob(
+      job(order, { ...mydata, transmissionFailure: true }, 'CP858').buffer,
+      'CP858',
+    );
+    expect(text).toContain('TRANSMISSION FAILURE');
+  });
+
+  it('prints a sandbox marker so a test receipt is never mistaken for a real one', () => {
+    const { text } = readJob(job(order, { ...mydata, sandbox: true }).buffer, 'CP1253');
+    expect(text).toContain('TEST (Sandbox)');
+  });
+
+  it('prints the provider footer when the provider supplies one', () => {
+    const { text } = readJob(
+      job(order, { ...mydata, providerFooter: 'fiskaltrust Greece' }).buffer,
+      'CP1253',
+    );
+    expect(text).toContain('fiskaltrust Greece');
+  });
+
+  it('prints nothing on a bill handed over before payment', () => {
+    const built = job({ ...order, isProvisional: true });
+    const { text } = readJob(built.buffer, 'CP1253');
+    expect(text).not.toContain('MARK:');
+    expect(built.buffer.includes(Buffer.from([0x1d, 0x28, 0x6b]))).toBe(false);
+  });
+
+  it('prints nothing when there is no myDATA record yet', () => {
+    const { text } = readJob(job(order, null).buffer, 'CP1253');
+    expect(text).not.toContain('MARK:');
+  });
+
+  it('does not print a MARK-only block when mark is empty', () => {
+    const { text } = readJob(job(order, { ...mydata, mark: '' }).buffer, 'CP1253');
+    expect(text).not.toContain('MARK:');
+  });
+});
+
 describe('test slip', () => {
   it('prints a column ruler and the code page sample', () => {
     const { text } = readJob(

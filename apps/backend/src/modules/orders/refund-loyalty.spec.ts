@@ -13,6 +13,7 @@ const svc = () =>
     {} as never,
     {} as never,
     {} as never,
+    {} as never,
   );
 
 function tx(over: {

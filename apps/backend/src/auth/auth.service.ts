@@ -26,6 +26,28 @@ import {
   type PermissionSource,
 } from './effective-permissions';
 
+/** A user row with the relations needed to build a session. */
+type LoginCandidate = Prisma.UserGetPayload<{ include: typeof permissionInclude }>;
+
+/** bcrypt cost used for every stored password; the timing equaliser must
+ * match it or a failed lookup is measurably cheaper than a wrong password. */
+const BCRYPT_ROUNDS = 12;
+
+/**
+ * Hash compared against when no account matched, so an unknown login ID costs
+ * the same wall-clock time as a wrong password on a real one. Computed lazily
+ * once per process at the same cost as register(), then reused. The plaintext
+ * is meaningless and never matches a user-supplied password.
+ */
+let dummyHash: Promise<string> | null = null;
+function dummyPasswordHash(): Promise<string> {
+  dummyHash ??= bcrypt.hash(
+    `timing-equaliser-${Date.now()}-${Math.random()}`,
+    BCRYPT_ROUNDS,
+  );
+  return dummyHash;
+}
+
 @Injectable()
 export class AuthService {
   constructor(
@@ -116,7 +138,10 @@ export class AuthService {
   async login(dto: LoginDto) {
     const include = permissionInclude;
     const id = dto.email.trim();
-    let user: Awaited<ReturnType<typeof this.findLoginCandidate>> = null;
+    let user: LoginCandidate | null = null;
+    // Count the password checks actually performed so the unknown-ID path can
+    // pad itself to the very same cost (see spendDummyChecks below).
+    let passwordChecks = 0;
     // An email address, or a phone number as the login ID (delivery riders).
     // Every failure gives the same message so nothing reveals which IDs exist.
     if (id.includes('@')) {
@@ -130,20 +155,21 @@ export class AuthService {
         take: 10,
       });
       for (const u of candidates) {
+        passwordChecks++;
         if (await bcrypt.compare(dto.password, u.passwordHash)) {
           user = u;
           break;
         }
       }
     } else {
-      user = await this.findLoginCandidate(id, dto.password);
+      const found = await this.findLoginCandidate(id, dto.password);
+      user = found.user;
+      passwordChecks = found.checks;
     }
     if (!user) {
-      // Spend comparable time when the ID is unknown, so timing does not reveal it.
-      await bcrypt.compare(
-        dto.password,
-        '$2b$10$invalidinvalidinvalidinvalidinvalidinvalidinvalidinvalidi',
-      );
+      // Spend the same bcrypt cost when the ID is unknown, so timing does not
+      // reveal whether the account exists.
+      await this.spendDummyChecks(dto.password, passwordChecks);
       throw new UnauthorizedException('Invalid login ID or password');
     }
 
@@ -174,20 +200,42 @@ export class AuthService {
     return this.issueSession(user, dto.deviceId);
   }
 
+  /**
+   * Run dummy bcrypt compares until at least one has happened, so a login that
+   * matched no account costs what a failed password on a real account costs.
+   * Reusing the same dummy hash keeps the per-call cost identical.
+   */
+  private async spendDummyChecks(
+    password: string,
+    done: number,
+  ): Promise<void> {
+    const hash = await dummyPasswordHash();
+    for (let i = done; i < Math.max(done, 1); i++) {
+      await bcrypt.compare(password, hash);
+    }
+  }
+
   /** Phone-number login: compare real digits, then the password, against every active match. */
-  private async findLoginCandidate(id: string, password: string) {
+  private async findLoginCandidate(
+    id: string,
+    password: string,
+  ): Promise<{ user: LoginCandidate | null; checks: number }> {
     const tail = id.replace(/\D/g, '').slice(-10);
-    if (tail.length < 6) return null;
+    if (tail.length < 6) return { user: null, checks: 0 };
     const candidates = await this.prisma.user.findMany({
       where: { isActive: true, phone: { endsWith: tail.slice(-6) } },
       include: permissionInclude,
       take: 10,
     });
+    let checks = 0;
     for (const u of candidates) {
       if ((u.phone ?? '').replace(/\D/g, '').slice(-10) !== tail) continue;
-      if (await bcrypt.compare(password, u.passwordHash)) return u;
+      checks++;
+      if (await bcrypt.compare(password, u.passwordHash)) {
+        return { user: u, checks };
+      }
     }
-    return null;
+    return { user: null, checks };
   }
 
   async register(dto: RegisterDto) {
@@ -224,7 +272,7 @@ export class AuthService {
     const allPermissions = await this.prisma.permission.findMany();
     const permissionByKey = new Map(allPermissions.map((p) => [p.key, p]));
 
-    const passwordHash = await bcrypt.hash(dto.password, 12);
+    const passwordHash = await bcrypt.hash(dto.password, BCRYPT_ROUNDS);
 
     const owner = await this.prisma.$transaction(async (tx) => {
       const restaurant = await tx.restaurant.create({

@@ -50,6 +50,7 @@ import {
 } from '../../common/online-price';
 import { ReferralsService } from '../referrals/referrals.service';
 import { VerifactuService } from '../verifactu/verifactu.service';
+import { MyDataService } from '../mydata/mydata.service';
 import { fromMinor } from '../../payment-gateways/money';
 
 const KOT_FORWARD_STATUSES = [
@@ -73,6 +74,7 @@ export class OrdersService {
     private readonly marketing: MarketingService,
     private readonly webhooks: WebhooksService,
     private readonly verifactu: VerifactuService,
+    private readonly mydata: MyDataService,
     private readonly referrals: ReferralsService,
   ) {}
 
@@ -1862,6 +1864,9 @@ export class OrdersService {
         // Spain VERI*FACTU: the sale's fiscal record is written in this same transaction, so a sale
         // is never paid without it (and a failure to produce it rolls the payment back).
         await this.verifactu.recordPaidOrder(tx, orderId);
+        // Greece myDATA (AADE): same transaction, same guarantee. A no-op unless
+        // myDATA is enabled for this deployment (see MyDataService.isEnabled).
+        await this.mydata.recordPaidOrder(tx, orderId);
       });
     } catch (err) {
       if (err instanceof Prisma.PrismaClientKnownRequestError) {
