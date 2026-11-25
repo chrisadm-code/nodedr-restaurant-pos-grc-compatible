@@ -28,12 +28,24 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { MyDataService } from './mydata.service';
 import { z } from 'zod';
 
+// Order-IDs sind in Prisma cuid2 (z.B. "cmww261z1001lsx01gu8ebi0f"), nicht
+// RFC-4122-UUIDs — z.string().uuid() verwarf deshalb JEDE echte Order mit 400.
+// Fix 2026-11-25: UUID oder cuid2 akzeptieren.
+const orderIdField = z
+  .string()
+  .refine(
+    (v) =>
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v) ||
+      /^c[a-z0-9]{20,40}$/i.test(v),
+    { message: 'orderId must be a UUID or cuid2' },
+  );
+
 const cancelSchema = z.object({
-  orderId: z.string().uuid(),
+  orderId: orderIdField,
   reason: z.string().max(500).optional(),
 });
 
-const orderIdSchema = z.string().uuid();
+const orderIdSchema = orderIdField;
 
 @ApiTags('mydata')
 @Controller('v1/mydata')
