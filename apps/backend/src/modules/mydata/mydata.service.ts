@@ -600,7 +600,8 @@ export class MyDataService {
     if (!mark) {
       throw new Error(
         'CloudCashbox returned no MARK — myDATA submission may have failed. ' +
-        `Signatures received: ${sigs.map(s => `${s.ftSignatureCaption}=${s.ftSignature.slice(0, 40)}`).join(', ')}`,
+        `Signatures received: ${sigs.map(s => `${s.ftSignatureCaption ?? '?'}=${String(s.ftSignature ?? '').slice(0, 40)}`).join(', ')}. ` +
+        `Response keys: ${Object.keys(data ?? {}).join(',')}.`,
       );
     }
 
