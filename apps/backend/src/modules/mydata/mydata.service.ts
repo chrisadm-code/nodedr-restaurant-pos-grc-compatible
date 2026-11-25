@@ -548,11 +548,13 @@ export class MyDataService {
       body.cbArea = receipt.tableArea.slice(0, 50);
     }
 
-    // Serialize BigInt fields as strings for JSON transport.
-    // The fiskaltrust API accepts numeric strings for Int64 fields.
+    // Serialize BigInt Int64 cases as raw JSON numbers.
+    // fiskaltrust v2 deserializes ftChargeItemCase etc. as System.Int64 and
+    // rejects quoted strings. A replacer returning a string would emit quotes,
+    // so bigints are encoded as @n:<digits> placeholders and unquoted below.
     const jsonBody = JSON.stringify(body, (_k, v) =>
-      typeof v === 'bigint' ? v.toString() : v,
-    );
+      typeof v === 'bigint' ? `@n:${v.toString()}` : v,
+    ).replace(/"@n:(\d+)"/g, '$1');
 
     const res = await fetch(`${this.providerUrl}/v2/sign`, {
       method: 'POST',

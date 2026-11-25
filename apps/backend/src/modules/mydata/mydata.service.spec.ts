@@ -580,18 +580,22 @@ describe('MyDataService — BigInt transport', () => {
 
     await svc.sendPending();
 
-    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    // Int64 case values must travel as unquoted JSON numbers with all digits
+    // intact — fiskaltrust v2 deserializes them as System.Int64 and rejects
+    // quoted strings. Check the raw body text, because JSON.parse itself
+    // would already collapse precision beyond 2^53.
+    const rawBody: string = fetchMock.mock.calls[0][1].body;
     const expectedCase = (CHARGE_ITEM_BASE | VAT_NORMAL).toString();
-    // Exact decimal string...
-    expect(body.cbChargeItems[0].ftChargeItemCase).toBe(expectedCase);
-    expect(body.cbReceiptCase).toBe(RECEIPT_CASE_POS_RECEIPT.toString());
+    const expectedReceiptCase = RECEIPT_CASE_POS_RECEIPT.toString();
+    expect(rawBody).toContain(`"ftChargeItemCase":${expectedCase}`);
+    expect(rawBody).toContain(`"cbReceiptCase":${expectedReceiptCase}`);
+    expect(rawBody).toContain(`"ftPayItemCase":${(COUNTRY_GR | 0x2000000000000001n).toString()}`);
+    // No quoted occurrences of the case values anywhere in the body.
+    expect(rawBody).not.toContain(`"ftChargeItemCase":"${expectedCase}"`);
     // ...and provably NOT what a Number would have produced. These Int64 values
     // exceed 2^53, so Number() silently changes the last digits and the
     // provider would receive a different tax/service case than intended.
     expect(Number(expectedCase).toString()).not.toBe(expectedCase);
-    expect(body.cbChargeItems[0].ftChargeItemCase).not.toBe(
-      Number(expectedCase).toString(),
-    );
   });
 
   it('reuses the stored checkout moment so the timestamp does not drift on retry', async () => {
