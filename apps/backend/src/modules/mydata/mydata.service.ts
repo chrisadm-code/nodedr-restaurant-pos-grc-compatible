@@ -598,10 +598,12 @@ export class MyDataService {
     const mark = markSig?.ftSignature ?? '';
 
     if (!mark) {
+      // v2 response items may use different property names than v0 — dump the
+      // raw signature entries so the actual shape becomes visible in logs.
       throw new Error(
         'CloudCashbox returned no MARK — myDATA submission may have failed. ' +
-        `Signatures received: ${sigs.map(s => `${s.ftSignatureCaption ?? '?'}=${String(s.ftSignature ?? '').slice(0, 40)}`).join(', ')}. ` +
-        `Response keys: ${Object.keys(data ?? {}).join(',')}.`,
+        `Raw ftSignatures: ${sigs.map(s => JSON.stringify(s)).join(' | ') || '<none>'}. ` +
+        `ftState: ${JSON.stringify((data as unknown as Record<string, unknown>)?.ftState ?? null)}.`,
       );
     }
 
