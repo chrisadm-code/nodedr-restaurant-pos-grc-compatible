@@ -15,10 +15,13 @@
  * HTTP: native fetch (Node 18+, built-in). Kein @nestjs/axios — verifactu
  * nutzt ebenfalls native node:https, das Projekt hat keine axios-Dependency.
  *
- * fiskaltrust PosSystem API (v2) für Griechenland:
- *   POST /v2/pos        — Beleg signieren + an myDATA übermitteln
- *   GET  /v2/pos/{id}   — Status abfragen (async processing)
- *   POST /v2/pos/cancel — Beleg stornieren (CancelInvoice)
+ * fiskaltrust PosSystem API v2 für Griechenland:
+ *   POST /v2/sign       — Beleg signieren + an myDATA übermitteln
+ *                         (auch Storno: Void-Receipt-Case via /v2/sign)
+ *   POST /v2/echo       — Connectivity-Check
+ *
+ * Auth (PosSystem API v2-Modell): Header x-cashbox-id, x-cashbox-accesstoken,
+ * x-operation-id (Idempotency-Key, pro Beleg/Operation frisch).
  *
  * CloudCashbox URL:
  *   Sandbox:     https://pos-api-sandbox.fiskaltrust.cloud
@@ -26,8 +29,11 @@
  *
  * Env-Konfiguration:
  *   MYDATA_ENABLED       — "true" aktiviert das Modul
- *   MYDATA_PROVIDER_URL  — CloudCashbox URL (sandbox oder produktion)
- *   MYDATA_API_KEY       — Provider API Key (aus kds-app-secret)
+ *   MYDATA_PROVIDER_URL  — CloudCashbox Basis-URL (sandbox oder produktion);
+ *                          eine /v2/<cashboxId>-Komponente im Pfad wird ignoriert
+ *   MYDATA_CASHBOX_ID   — (optional) explizite CashBox-ID; sonst wird die GUID
+ *                          aus MYDATA_PROVIDER_URL oder der VAT-Wert genutzt
+ *   MYDATA_API_KEY       — CashBox Access Token (aus kds-app-secret)
  *   MYDATA_VAT_NUMBER    — USt-IdNr des Restaurants (ELXXXXXXXXX)
  *
  * Signature Items (ftSignatures in der Response):
@@ -47,6 +53,7 @@ import {
   Injectable,
   Logger,
 } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
 import { ConfigService } from '@nestjs/config';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { Prisma } from '@prisma/client';
@@ -236,7 +243,26 @@ export class MyDataService {
   private get providerUrl(): string {
     const url = this.config.get<string>('MYDATA_PROVIDER_URL')
       ?? 'https://pos-api-sandbox.fiskaltrust.cloud';
-    return url.replace(/\/$/, '');
+    // PosSystem API v2 is addressed by base host + x-cashbox-id header.
+    // Older installer configs embedded the cashbox ID in the path
+    // (/v2/<cashboxId>) — strip it so endpoints resolve to /v2/sign etc.
+    return url
+      .replace(/\/(?=\/|$)/, '')
+      .replace(/\/v2\/[0-9a-fA-F-]{32,36}$/, '');
+  }
+
+  /**
+   * CashBox identifier for the x-cashbox-id header. Preferred source: explicit
+   * MYDATA_CASHBOX_ID; fallback: the GUID embedded in MYDATA_PROVIDER_URL;
+   * last resort: the configured VAT number (legacy installer behavior).
+   */
+  private get cashboxId(): string {
+    const explicit = this.config.get<string>('MYDATA_CASHBOX_ID');
+    if (explicit) return explicit.trim();
+    const fromUrl = this.config
+      .get<string>('MYDATA_PROVIDER_URL')
+      ?.match(/\/v2\/([0-9a-fA-F-]{32,36})\/?$/)?.[1];
+    return fromUrl ?? this.vatNumber;
   }
 
   private get apiKey(): string {
@@ -263,21 +289,21 @@ export class MyDataService {
    */
   async health(): Promise<boolean> {
     try {
-      const res = await fetch(`${this.providerUrl}/health`, {
-        method: 'GET',
-        headers: this.authHeaders(),
+      const res = await fetch(`${this.providerUrl}/v2/echo`, {
+        method: 'POST',
+        headers: this.authHeaders(randomUUID()),
+        body: '{}',
         signal: AbortSignal.timeout(5_000),
       });
-      // Any HTTP response proves reachability — the sandbox has no /health
-      // route and answers 404, which is a successful round-trip, not an
-      // outage. Only transport errors (thrown below) mean unreachable.
-      return res.status < 500;
+      // 401/404-style responses still prove the endpoint is live; only
+      // transport errors below mean unreachable.
+      return res.status !== 0 && res.status < 500;
     } catch {
       // Fallback: GET auf die Basis-URL
       try {
         const res = await fetch(`${this.providerUrl}`, {
           method: 'GET',
-          headers: this.authHeaders(),
+          headers: { 'Content-Type': 'application/json' },
           signal: AbortSignal.timeout(5_000),
         });
         return true;
@@ -287,10 +313,14 @@ export class MyDataService {
     }
   }
 
-  private authHeaders(): Record<string, string> {
+  private authHeaders(operationId: string): Record<string, string> {
+    // PosSystem API v2 authentication (docs.fiskaltrust.cloud → POS System API
+    // → Authentication): every request carries cashbox id + access token plus
+    // a per-operation idempotency key. No Bearer Authorization header.
     return {
-      'Authorization': `Bearer ${this.apiKey}`,
-      'X-FT-API-KEY': this.apiKey,
+      'x-cashbox-id': this.cashboxId,
+      'x-cashbox-accesstoken': this.apiKey,
+      'x-operation-id': operationId,
       'Content-Type': 'application/json',
     };
   }
@@ -471,7 +501,10 @@ export class MyDataService {
 
   /**
    * Übermittelt einen Beleg über die fiskaltrust PosSystem API v2.
-   * POST /v2/pos → gibt MARK, UID, QR-Code etc. zurück.
+   * POST /v2/sign → gibt MARK, UID, QR-Code etc. zurück.
+   * Idempotency: x-operation-id per attempt; body is deterministic per receipt
+   * (cbReceiptMoment pinned), so retrying with the same operation id is safe
+   * when needed.
    */
   private async submitReceipt(receipt: {
     id: string;
@@ -519,16 +552,16 @@ export class MyDataService {
       typeof v === 'bigint' ? v.toString() : v,
     );
 
-    const res = await fetch(`${this.providerUrl}/v2/pos`, {
+    const res = await fetch(`${this.providerUrl}/v2/sign`, {
       method: 'POST',
-      headers: this.authHeaders(),
+      headers: this.authHeaders(randomUUID()),
       body: jsonBody,
       signal: AbortSignal.timeout(API_TIMEOUT),
     });
 
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      throw new Error(`CloudCashbox POST /v2/pos failed: ${res.status} ${res.statusText} — ${text.slice(0, 500)}`);
+      throw new Error(`CloudCashbox POST /v2/sign failed: ${res.status} ${res.statusText} — ${text.slice(0, 500)}`);
     }
 
     const data: FtPosResponse = await res.json();
@@ -608,7 +641,8 @@ export class MyDataService {
 
   /**
    * Storniert einen bereits übermittelten Beleg bei myDATA.
-   * Verwendet POST /v2/pos/cancel mit der MARK des Originalbelegs.
+   * PosSystem API v2 hat keinen separaten Cancel-Endpunkt — Storno ist ein
+   * Beleg mit Void-Receipt-Case via POST /v2/sign.
    */
   async cancelReceipt(orderId: string, reason?: string): Promise<void> {
     if (!this.isEnabled) return;
@@ -644,16 +678,16 @@ export class MyDataService {
       cbNote: reason ?? 'Storno',
     };
 
-    const res = await fetch(`${this.providerUrl}/v2/pos/cancel`, {
+    const res = await fetch(`${this.providerUrl}/v2/sign`, {
       method: 'POST',
-      headers: this.authHeaders(),
+      headers: this.authHeaders(randomUUID()),
       body: JSON.stringify(cancelBody),
       signal: AbortSignal.timeout(API_TIMEOUT),
     });
 
     if (!res.ok) {
       const text = await res.text().catch(() => '');
-      throw new Error(`CloudCashbox POST /v2/pos/cancel failed: ${res.status} ${res.statusText} — ${text.slice(0, 500)}`);
+      throw new Error(`CloudCashbox POST /v2/sign (cancel) failed: ${res.status} ${res.statusText} — ${text.slice(0, 500)}`);
     }
 
     const data: FtPosResponse = await res.json();
