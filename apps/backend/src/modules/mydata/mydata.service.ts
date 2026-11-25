@@ -530,8 +530,10 @@ export class MyDataService {
     }));
 
     const body: FtPosRequest = {
-      ftCashBoxID: this.vatNumber,
-      ftQueueID: this.vatNumber,
+      // PosSystem API v2 validates ftCashBoxID/ftQueueID as GUIDs — header
+      // auth already scopes the request, body must carry the cashbox GUID.
+      ftCashBoxID: this.cashboxId,
+      ftQueueID: this.cashboxId,
       cbTerminalID: 'orderrestro-backend',
       cbReceiptReference: receipt.orderNumber,
       // Reuse the original checkout moment so the Belegzeitstempel doesn't drift on retry.
@@ -661,8 +663,8 @@ export class MyDataService {
     this.logger.log(`Cancelling receipt ${original.orderNumber} (MARK=${original.mark})...`);
 
     const cancelBody = {
-      ftCashBoxID: this.vatNumber,
-      ftQueueID: this.vatNumber,
+      ftCashBoxID: this.cashboxId,
+      ftQueueID: this.cashboxId,
       cbReceiptReference: `CANCEL-${original.orderNumber}`,
       cbReceiptMoment: new Date().toISOString(),
       cbReceiptCase: RECEIPT_CASE_VOID.toString(),
