@@ -103,6 +103,9 @@ interface FtAmount {
 interface FtChargeItem {
   ftChargeLine: number;
   ftChargeText?: string;
+  // PosSystem API v2 validates cbChargeItems[].Description (must not be empty);
+  // ftChargeText alone is not read by the v2 model.
+  Description?: string;
   ftChargeAmount: number;
   ftChargeItemCase?: bigint; // carries VAT rate + service type
   ftChargeItemCaseData?: unknown;
@@ -111,6 +114,7 @@ interface FtChargeItem {
 interface FtPayItem {
   ftPayLine: number;
   ftPayText?: string;
+  Description?: string;
   ftPayAmount: number;
   ftPayItemCase?: bigint;
 }
@@ -360,9 +364,11 @@ export class MyDataService {
     // This matches how verifactu.service.ts handles it (Number(i.taxRateSnapshot)).
     const chargeItems: FtChargeItem[] = order.items.map((item, idx) => {
       const itemVatV = this.deriveVatV(Number(item.taxRateSnapshot));
+      const desc = (item.nameSnapshot ?? `Item ${idx + 1}`).slice(0, 200);
       return {
         ftChargeLine: idx + 1,
-        ftChargeText: item.nameSnapshot ?? `Item ${idx + 1}`,
+        ftChargeText: desc,
+        Description: desc,
         ftChargeAmount: Number(item.lineTotal),
         ftChargeItemCase: CHARGE_ITEM_BASE | itemVatV,
       };
@@ -372,6 +378,7 @@ export class MyDataService {
     const payItems: FtPayItem[] = order.payments.map((pay, idx) => ({
       ftPayLine: idx + 1,
       ftPayText: String(pay.method),
+      Description: String(pay.method),
       ftPayAmount: Number(pay.amount),
       ftPayItemCase: pay.method === 'CASH' ? PAY_CASH : PAY_CARD,
     }));
@@ -522,10 +529,12 @@ export class MyDataService {
     // Charge/pay items were stored with BigInt case values as strings.
     const chargeItems = JSON.parse(receipt.chargeItems).map((ci: any) => ({
       ...ci,
+      Description: ci.Description ?? ci.ftChargeText ?? '',
       ftChargeItemCase: ci.ftChargeItemCase ? BigInt(ci.ftChargeItemCase) : undefined,
     }));
     const payItems = JSON.parse(receipt.payItems).map((pi: any) => ({
       ...pi,
+      Description: pi.Description ?? pi.ftPayText ?? '',
       ftPayItemCase: pi.ftPayItemCase ? BigInt(pi.ftPayItemCase) : undefined,
     }));
 
