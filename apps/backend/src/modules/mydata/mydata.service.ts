@@ -84,6 +84,7 @@ type Tx = Prisma.TransactionClient;
 interface FtPosRequest {
   ftCashBoxID: string;
   ftQueueID: string;
+  ftPosSystemId?: string; // identifies the POS software — checked by Portal basic receipt validation
   cbTerminalID: string;
   cbReceiptReference: string;
   cbReceiptMoment: string; // ISO 8601
@@ -543,6 +544,11 @@ export class MyDataService {
       // auth already scopes the request, body must carry the cashbox GUID.
       ftCashBoxID: this.cashboxId,
       ftQueueID: this.cashboxId,
+      // Stable software identity for the Portal's basic receipt validation
+      // ("receipts should include the PosSystemId"). Overridable via env.
+      ftPosSystemId:
+        this.config.get<string>('MYDATA_POS_SYSTEM_ID') ??
+        'df9dc44c-18ef-41c6-bf7e-c84ca65d0190',
       cbTerminalID: 'orderrestro-backend',
       cbReceiptReference: receipt.orderNumber,
       // Reuse the original checkout moment so the Belegzeitstempel doesn't drift on retry.
