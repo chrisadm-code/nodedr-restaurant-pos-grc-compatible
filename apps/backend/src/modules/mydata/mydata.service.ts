@@ -1140,8 +1140,12 @@ export class MyDataService {
   async getReceiptData(orderId: string): Promise<ReceiptMyData | null> {
     if (!this.isEnabled) return null;
 
+    // documentType: SALE — a refund is a SUBMITTED receipt of its own on the
+    // same order, and it is the newest row. Without this filter a reprinted
+    // bill would show the refund document (negative totals, REFUND- number)
+    // instead of the sale the guest is holding.
     const receipt = await this.prisma.myDataReceipt.findFirst({
-      where: { orderId, status: 'SUBMITTED' },
+      where: { orderId, status: 'SUBMITTED', documentType: 'SALE' },
       orderBy: { createdAt: 'desc' },
     });
 
@@ -1172,8 +1176,11 @@ export class MyDataService {
   async cancelReceipt(orderId: string, reason?: string): Promise<void> {
     if (!this.isEnabled) return;
 
+    // Void applies to the sale document. With a refund on the same order this
+    // row would otherwise be the refund, and "cancelling" it would void the
+    // correction instead of the sale.
     const original = await this.prisma.myDataReceipt.findFirst({
-      where: { orderId, status: 'SUBMITTED' },
+      where: { orderId, status: 'SUBMITTED', documentType: 'SALE' },
       orderBy: { createdAt: 'desc' },
     });
 

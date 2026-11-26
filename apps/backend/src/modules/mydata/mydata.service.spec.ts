@@ -435,10 +435,36 @@ describe('MyDataService.getReceiptData', () => {
       receiptNumber: 7,
       sandbox: true,
     });
-    // only a SUBMITTED row is printable
+    // only a SUBMITTED row is printable — and only the SALE: a refund is a
+    // SUBMITTED row of its own on the same order, and printing it would show
+    // the guest negative totals instead of what they bought.
     expect(prisma.myDataReceipt.findFirst).toHaveBeenCalledWith(
-      expect.objectContaining({ where: { orderId: 'o1', status: 'SUBMITTED' } }),
+      expect.objectContaining({
+        where: { orderId: 'o1', status: 'SUBMITTED', documentType: 'SALE' },
+      }),
     );
+  });
+
+  it('never returns a refund document for reprinting', async () => {
+    const { svc, prisma } = build();
+    prisma.myDataReceipt.findFirst.mockResolvedValue({
+      documentType: 'REFUND',
+      mark: 'REFUND-MARK',
+      uid: '',
+      authenticationCode: '',
+      uniqueDocumentIdentifier: '',
+      ftReceiptNumber: 0,
+      ftTimestamp: null,
+      ftHash: '',
+      transmissionFailure: false,
+      providerFooter: null,
+      sandbox: true,
+    });
+    await svc.getReceiptData('o1');
+
+    // The filter is what keeps a refund from being rendered as the bill.
+    const where = prisma.myDataReceipt.findFirst.mock.calls[0][0].where;
+    expect(where.documentType).toBe('SALE');
   });
 });
 
