@@ -154,16 +154,26 @@ interface FtPosResponse {
     ftReceiptHash: string;
   };
   ftSignatures: FtSignature[];
-  ftState: {
-    ftState: string;
-    ftStateTimestamp: string;
-  };
+  // v2 returns the state as a uint64. Declared as a string here because the
+  // digits must not pass through a JS number: 0x4752200000000000 (READY) is
+  // logged as …246000 instead of …246080, which makes a healthy queue look like
+  // it carries an error flag.
+  ftState?: string;
+  ftStateData?: string;
+  // The middleware echoes the processed line items. They carry the amounts it
+  // actually booked, which is our only server-side proof of what the
+  // ReceiptJournal displays.
+  ftChargeItems?: Array<{ description?: string; amount?: number; vatRate?: number }>;
+  ftPayItems?: Array<{ description?: string; amount?: number }>;
 }
 
 interface FtSignature {
   ftSignatureType: number;
-  ftSignature: string;      // Data — Base64, URL, or text depending on format
-  ftSignatureCaption: string; // Human-readable caption
+  // v2 spells these lower-case; older payloads use the C# property names.
+  ftSignature?: string;
+  data?: string;
+  ftSignatureCaption?: string;
+  caption?: string;
   ftSignatureFormat: number;  // 1 = QR, 2 = Text, 3 = Base64
 }
 
@@ -347,6 +357,16 @@ export class MyDataService {
         return false;
       }
     }
+  }
+
+  /**
+   * Reads the response body as text, with a fallback to json() when the
+   * runtime stub only implements that (jest mocks). Full-text reading is
+   * required for precision-safe uint64 handling.
+   */
+  private async readRawBody(res: Response): Promise<string> {
+    if (typeof res.text === 'function') return res.text();
+    return JSON.stringify(await res.json());
   }
 
   private authHeaders(operationId: string): Record<string, string> {
@@ -693,12 +713,28 @@ export class MyDataService {
       throw new Error(`CloudCashbox POST /v2/sign failed: ${res.status} ${res.statusText} — ${text.slice(0, 500)}`);
     }
 
-    const data: FtPosResponse = await res.json();
+    // Read the body as text so uint64 fields can be read at full precision.
+    // JSON.parse turns 0x4752200000000000 into a double and loses the last
+    // digits, which is how a READY queue ends up looking like it has an error
+    // flag set.
+    const rawResponse = await this.readRawBody(res);
+    const data: FtPosResponse = JSON.parse(rawResponse);
+    const exactState = rawResponse.match(/"ftState"\s*:\s*"?(\d+)"?/)?.[1];
+
+    // The payloads in the wild use three different spellings for the same two
+    // fields: the v2 spec says data/caption, the C# model says
+    // ftSignature/ftSignatureCaption, and the sandbox actually returns
+    // Data/Caption. Accept all of them, otherwise a real MARK would be read as
+    // an empty string and the receipt would look unsigned.
+    const sigs: FtSignature[] = (data.ftSignatures ?? []).map((s: any) => ({
+      ...s,
+      ftSignature: s.ftSignature ?? s.data ?? s.Data ?? '',
+      ftSignatureCaption: s.ftSignatureCaption ?? s.caption ?? s.Caption ?? '',
+    }));
 
     // Parse signature items.
     // ftSignatureType is Int64 (country-coded). JSON.parse may lose precision.
     // We match by SignatureCase (low 12 bits) first, then by caption as fallback.
-    const sigs: FtSignature[] = data.ftSignatures ?? [];
 
     const findSig = (sss: number, captionFallback: string): FtSignature | undefined =>
       matchSigByCase(sigs, sss) ?? matchSigByCaption(sigs, captionFallback);
@@ -714,12 +750,14 @@ export class MyDataService {
     const mark = markSig?.ftSignature ?? '';
 
     if (!mark) {
-      // v2 response items may use different property names than v0 — dump the
-      // raw signature entries so the actual shape becomes visible in logs.
+      // Dump what the middleware actually booked. The echo carries the amounts,
+      // which is the only server-side proof of what the ReceiptJournal shows.
       throw new Error(
         'CloudCashbox returned no MARK — myDATA submission may have failed. ' +
         `Raw ftSignatures: ${sigs.map(s => JSON.stringify(s)).join(' | ') || '<none>'}. ` +
-        `ftState: ${JSON.stringify((data as unknown as Record<string, unknown>)?.ftState ?? null)}.`,
+        `ftState: ${exactState ?? data.ftState ?? '<none>'}. ` +
+        `Booked charge items: ${JSON.stringify(data.ftChargeItems ?? [])}. ` +
+        `Booked pay items: ${JSON.stringify(data.ftPayItems ?? [])}.`,
       );
     }
 
@@ -827,7 +865,13 @@ export class MyDataService {
     }
 
     const data: FtPosResponse = await res.json();
-    const sigs: FtSignature[] = data.ftSignatures ?? [];
+    // Same field-name normalization as submitReceipt — the sandbox returns
+    // Data/Caption, the v2 spec data/caption, the C# model ftSignature*.
+    const sigs: FtSignature[] = (data.ftSignatures ?? []).map((s: any) => ({
+      ...s,
+      ftSignature: s.ftSignature ?? s.data ?? s.Data ?? '',
+      ftSignatureCaption: s.ftSignatureCaption ?? s.caption ?? s.Caption ?? '',
+    }));
 
     const cancelMarkSig = matchSigByCase(sigs, 0x014) ?? matchSigByCaption(sigs, 'invoiceMark');
     const cancelMark = cancelMarkSig?.ftSignature ?? null;
