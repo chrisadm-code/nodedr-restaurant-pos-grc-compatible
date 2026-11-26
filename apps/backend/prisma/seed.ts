@@ -28,6 +28,15 @@ function priceLine(
 
 const prisma = new PrismaClient();
 
+// Greek VAT (EL) for the demo menu. The upstream seed shipped Indian GST rates
+// (5/18%), which do not exist in Greece and make every receipt fail myDATA
+// validation with "VATRate ... is invalid for the given Type of VAT".
+// Greek rates: standard 24%, reduced 6/13/17%, super-reduced 4%.
+// Restaurant services are 13%; beverages are sold at the standard 24%.
+// Source: European Commission, VAT rates applied in EU member countries (EL).
+const VAT_FOOD = 13;
+const VAT_DRINK = 24;
+
 async function main() {
   console.log('Seeding permissions...');
   for (const permission of PERMISSIONS) {
@@ -47,7 +56,10 @@ async function main() {
     create: {
       id: 'demo-restaurant',
       name: 'Nodedr Bistro (Demo)',
-      currency: 'INR',
+      // Greece — the upstream seed hard-coded INR from the Indian origin of the
+      // fork, which contradicts both the GR market and the EUR amounts sent to
+      // myDATA.
+      currency: 'EUR',
     },
   });
 
@@ -249,7 +261,7 @@ async function main() {
       categoryId: starters.id,
       stationId: mainKitchen.id,
       price: 280,
-      taxRatePercent: 5,
+      taxRatePercent: VAT_FOOD,
       isVeg: true,
     },
     {
@@ -258,7 +270,7 @@ async function main() {
       categoryId: starters.id,
       stationId: mainKitchen.id,
       price: 320,
-      taxRatePercent: 5,
+      taxRatePercent: VAT_FOOD,
       isVeg: false,
     },
     {
@@ -267,7 +279,7 @@ async function main() {
       categoryId: mains.id,
       stationId: mainKitchen.id,
       price: 420,
-      taxRatePercent: 5,
+      taxRatePercent: VAT_FOOD,
       isVeg: true,
       modifierGroupId: crustGroup.id,
     },
@@ -277,7 +289,7 @@ async function main() {
       categoryId: mains.id,
       stationId: mainKitchen.id,
       price: 480,
-      taxRatePercent: 5,
+      taxRatePercent: VAT_FOOD,
       isVeg: false,
     },
     {
@@ -286,7 +298,7 @@ async function main() {
       categoryId: drinks.id,
       stationId: bar.id,
       price: 220,
-      taxRatePercent: 18,
+      taxRatePercent: VAT_DRINK,
       isVeg: true,
     },
     {
@@ -295,7 +307,7 @@ async function main() {
       categoryId: drinks.id,
       stationId: bar.id,
       price: 90,
-      taxRatePercent: 18,
+      taxRatePercent: VAT_DRINK,
       isVeg: true,
     },
   ];
@@ -303,7 +315,11 @@ async function main() {
   for (const item of demoItems) {
     await prisma.menuItem.upsert({
       where: { id: item.id },
-      update: {},
+      // Corrective on purpose: the upstream seed wrote Indian GST rates, and an
+      // empty update block would leave already-seeded articles on 5/18% — the
+      // exact values myDATA rejects. Only the rate is synced, so locally edited
+      // names/prices are preserved.
+      update: { taxRatePercent: item.taxRatePercent },
       create: {
         id: item.id,
         branchId: branch.id,
