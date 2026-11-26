@@ -210,17 +210,26 @@ const RECEIPT_CASE_POS_RECEIPT = COUNTRY_GR | 0x0000200000000001n;
 const RECEIPT_CASE_VOID = COUNTRY_GR | 0x0000200000000002n;
 
 // ftChargeItemCase: CCCC_vlll_gggg_NNSV
-//   V (lowest nibble) = VAT rate, S (second nibble) = type of service,
+//   V (lowest nibble) = VAT rate code, S (second nibble) = type of service,
 //   NN (bits 8-15) = nature of VAT (00 = usual VAT applies)
-//   S=1 (delivery/supply of goods) therefore sets 0x10, not 0x00.
+//   S=1 (delivery/supply of goods) therefore sets 0x10.
+//
+// V is deliberately left at 0 ("Unknown VAT rate"): the documentation states
+// that the rate is then resolved from the saved VAT-rates table using the
+// VATRate field, and that omitting the case entirely falls back to the VATRate
+// at the point of sale. Guessing the code-percentage mapping produced
+// "VATRate '6' is invalid for the given Type of VAT '0000000000000004'",
+// because V=4 is not the 6% rate.
 // Source: docs.fiskaltrust.cloud/.../greece/reference-tables/ftchargeitemcase
-const CHARGE_ITEM_BASE = COUNTRY_GR | 0x0000200000000010n; // v=2, NN=00, S=1, V=0
+const CHARGE_ITEM_BASE = COUNTRY_GR | 0x0000200000000010n; // v=2, NN=00, S=1, V=0 (resolved from VATRate)
 const VAT_NORMAL        = 3n; // Normal VAT rate (24%)
 const VAT_DISCOUNTED_1  = 1n; // Discounted-1 VAT rate (13%)
 const VAT_DISCOUNTED_2  = 2n; // Discounted-2 VAT rate
-const VAT_SUPER_REDUCED = 4n; // Super-reduced-1 VAT rate (6%)
+const VAT_SUPER_REDUCED = 4n; // Super-reduced-1 VAT rate
 const VAT_ZERO          = 7n; // Zero VAT rate (0%)
 const VAT_NOT_TAXABLE   = 8n; // Not Taxable
+// NOTE: these are rate *codes*, not percentages. The percentage a code stands
+// for is defined by the fiscal VAT-rates table and must not be inferred here.
 
 // ftPayItemCase: CCCC_vlll_gggg_xxPP — PP is the payment type byte
 //   01 = cash, 04 = POS/e-POS (card terminal)
@@ -416,7 +425,6 @@ export class MyDataService {
     // This matches how verifactu.service.ts handles it (Number(i.taxRateSnapshot)).
     const chargeItems: FtChargeItem[] = order.items.map((item, idx) => {
       const vatRate = Number(item.taxRateSnapshot);
-      const itemVatV = this.deriveVatV(vatRate);
       const desc = (item.nameSnapshot ?? `Item ${idx + 1}`).slice(0, 200);
       return {
         Quantity: Number(item.quantity ?? 1),
@@ -424,7 +432,10 @@ export class MyDataService {
         Amount: Number(item.lineTotal),
         VATRate: vatRate,
         Position: idx + 1,
-        ftChargeItemCase: CHARGE_ITEM_BASE | itemVatV,
+        // V stays 0 (unknown) so the middleware resolves the rate code from its
+        // own VAT-rates table using VATRate. Encoding the code ourselves put a
+        // 7% line on V=4 and the middleware rejected it as an invalid rate.
+        ftChargeItemCase: CHARGE_ITEM_BASE,
       };
     });
 
@@ -436,12 +447,11 @@ export class MyDataService {
       ftPayItemCase: pay.method === 'CASH' ? PAY_CASH : PAY_CARD,
     }));
 
-    // Per-VAT-category totals, kept for local reporting. v2 requests carry a
-    // single gross cbReceiptAmount instead of this v0-style array.
-    const vatBuckets = new Map<bigint, number>();
+    // Per-VAT-rate totals, kept for local reporting. v2 requests carry a single
+    // gross cbReceiptAmount instead of this v0-style array.
+    const vatBuckets = new Map<number, number>();
     for (const ci of chargeItems) {
-      const v = ci.ftChargeItemCase! & 0xfn;
-      vatBuckets.set(v, (vatBuckets.get(v) ?? 0) + ci.Amount);
+      vatBuckets.set(ci.VATRate, (vatBuckets.get(ci.VATRate) ?? 0) + ci.Amount);
     }
 
     // Discounts. The order total is already net of discountAmount and
@@ -455,7 +465,7 @@ export class MyDataService {
     const chargeSum = chargeItems.reduce((sum, ci) => sum + ci.Amount, 0);
     if (discountTotal > 0 && chargeSum > 0) {
       let position = chargeItems.length;
-      for (const [vat, bucketAmount] of vatBuckets.entries()) {
+      for (const [vatRate, bucketAmount] of vatBuckets.entries()) {
         // Split the discount across VAT rates in proportion to each bucket, so
         // every bucket keeps the tax it actually carries.
         const share = Math.round((discountTotal * bucketAmount / chargeSum) * 100) / 100;
@@ -465,15 +475,15 @@ export class MyDataService {
           Quantity: 1,
           Description: 'Discount',
           Amount: -share,
-          VATRate: this.vatRateFromCase(vat),
+          VATRate: vatRate,
           Position: position,
-          ftChargeItemCase: CHARGE_ITEM_BASE | vat | DISCOUNT_FLAG,
+          ftChargeItemCase: CHARGE_ITEM_BASE | DISCOUNT_FLAG,
         });
       }
     }
-    const amounts: FtAmount[] = [...vatBuckets.entries()].map(([v, amt]) => ({
+    const amounts: FtAmount[] = [...vatBuckets.entries()].map(([rate, amt]) => ({
       ftAmount: amt,
-      ftTaxCR: Number(v),
+      ftTaxCR: rate,
     }));
 
     await tx.myDataReceipt.create({
@@ -597,6 +607,7 @@ export class MyDataService {
    */
   private async submitReceipt(receipt: {
     id: string;
+    orderId: string;
     orderNumber: string;
     receiptCase: bigint;
     amounts: string;
@@ -612,7 +623,23 @@ export class MyDataService {
     // field fix carry ftChargeLine/ftChargeText/ftChargeAmount, newer rows
     // carry Quantity/Amount/VATRate. Normalize to the v2 model here so
     // already-queued receipts submit with real amounts instead of Amount=0.
-    const chargeItems: FtChargeItem[] = JSON.parse(receipt.chargeItems).map(
+    //
+    // Rows queued before VATRate was transmitted carry no rate at all. The rate
+    // codes in ftChargeItemCase are not percentages, so deriving the percentage
+    // from them is guesswork — instead read the real rates from the order.
+    const storedItems: any[] = JSON.parse(receipt.chargeItems);
+    const missingRate = storedItems.some(ci => ci.VATRate == null);
+    const orderRates: number[] = missingRate
+      ? (
+          await this.prisma.orderItem.findMany({
+            where: { orderId: receipt.orderId },
+            orderBy: { id: 'asc' },
+            select: { taxRateSnapshot: true },
+          })
+        ).map(i => Number(i.taxRateSnapshot))
+      : [];
+
+    const chargeItems: FtChargeItem[] = storedItems.map(
       (ci: any, idx: number) => {
         const itemCase = this.repairItemCase(
           ci.ftChargeItemCase ? BigInt(ci.ftChargeItemCase) : undefined,
@@ -622,9 +649,7 @@ export class MyDataService {
           Quantity: Number(ci.Quantity ?? 1),
           Description: String(ci.Description ?? ci.ftChargeText ?? ''),
           Amount: Number(ci.Amount ?? ci.ftChargeAmount ?? 0),
-          // Older rows carry no VATRate. Derive it from the case nibble we
-          // wrote, so Amount and tax rate never contradict each other in v2.
-          VATRate: Number(ci.VATRate ?? this.vatRateFromCase(itemCase)),
+          VATRate: Number(ci.VATRate ?? orderRates[idx] ?? 0),
           Position: Number(ci.Position ?? ci.ftChargeLine ?? idx + 1),
           ftChargeItemCase: itemCase,
         };
@@ -661,7 +686,7 @@ export class MyDataService {
         Amount: reconciliation,
         VATRate: largest.VATRate,
         Position: chargeItems.length + 1,
-        ftChargeItemCase: CHARGE_ITEM_BASE | (largest.ftChargeItemCase! & 0xfn) | DISCOUNT_FLAG,
+        ftChargeItemCase: CHARGE_ITEM_BASE | DISCOUNT_FLAG,
       });
     }
 
@@ -903,40 +928,6 @@ export class MyDataService {
   // ─── Hilfsfunktionen ────────────────────────────────────────────────────────
 
   /**
-   * Leitet den ftChargeItemCase-VAT-Nibble (V) aus dem Steuersatz ab.
-   *
-   * Griechische Mehrwertsteuersätze und ihre ftChargeItemCase V-Werte:
-   *   24% → V=3 (Normal VAT rate)
-   *   13% → V=1 (Discounted-1 VAT rate)
-   *    6% → V=4 (Super-reduced-1 VAT rate)
-   *    0% → V=7 (Zero VAT rate)
-   *
-   * Source: docs.fiskaltrust.cloud/.../ftchargeitemcase Table 1 (V - VAT)
-   */
-  private deriveVatV(taxRate: number | string | null): bigint {
-    const rate = Number(taxRate ?? 0);
-    if (rate >= 20) return VAT_NORMAL;        // 24%
-    if (rate >= 10) return VAT_DISCOUNTED_1;  // 13%
-    if (rate > 0) return VAT_SUPER_REDUCED;   // 6%
-    return VAT_ZERO;                           // 0%
-  }
-
-  /**
-   * Inverse of deriveVatV: the Greek VAT percentage behind a V nibble. Used to
-   * fill VATRate for receipts queued before VATRate was transmitted at all.
-   */
-  private vatRateFromCase(itemCase: bigint | undefined): number {
-    if (!itemCase) return 0;
-    switch (itemCase & 0xfn) {
-      case VAT_NORMAL: return 24;
-      case VAT_DISCOUNTED_1: return 13;
-      case VAT_DISCOUNTED_2: return 13;
-      case VAT_SUPER_REDUCED: return 6;
-      default: return 0; // zero rate / not taxable
-    }
-  }
-
-  /**
    * Rebuilds a stored case value with the country code and version nibble
    * forced to their correct positions.
    *
@@ -945,6 +936,10 @@ export class MyDataService {
    * rejects the value as an invalid case. Keep the semantic low bits (nature of
    * VAT, type of service, discount flags, payment type) and re-anchor them on
    * 0x4752 + version 2.
+   *
+   * The V nibble is dropped on purpose: older rows carry a code derived from a
+   * wrong percentage mapping, and fiskaltrust resolves the rate from VATRate
+   * when V is 0 ("unknown").
    */
   private repairItemCase(
     itemCase: bigint | undefined,
@@ -956,11 +951,15 @@ export class MyDataService {
     const flags = itemCase & 0xffff0000n; // gggg (discount, void, …)
 
     if (kind === 'charge') {
-      // NNSV: keep nature-of-VAT (NN, bits 8-15) and VAT rate (V, bits 0-3),
-      // force S=1 (supply of goods) like every newly written line.
+      // NNSV: keep nature-of-VAT (NN, bits 8-15), force S=1 (supply of goods)
+      // like every newly written line, and drop V (bits 0-3).
+      //
+      // Old rows carry a V code produced by a wrong percentage mapping (a 7%
+      // line was stored as V=4). Passing it on made fiskaltrust reject the
+      // receipt with "VATRate ... is invalid for the given Type of VAT". With
+      // V=0 (unknown) the middleware resolves the rate from VATRate instead.
       const nn = itemCase & 0x0000ff00n;
-      const vat = itemCase & 0x0fn;
-      return version | flags | nn | 0x10n | vat;
+      return version | flags | nn | 0x10n;
     }
 
     // xxPP: the payment type byte. The pre-fix code encoded card as 0x10, which
