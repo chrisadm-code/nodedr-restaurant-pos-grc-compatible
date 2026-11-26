@@ -456,7 +456,47 @@ export class MyDataService {
     // Charge Items aus Bestellpositionen — each item carries its own
     // taxRateSnapshot (Decimal), so VAT is derived per-line, not per-order.
     // This matches how verifactu.service.ts handles it (Number(i.taxRateSnapshot)).
-    const chargeItems: FtChargeItem[] = order.items.map((item, idx) => {
+    // Charge items, each followed by its own discount line.
+    //
+    // GR doc (Data Structures → Discounts and extras): a charge item carrying
+    // the Discount flag is assigned to the charge item *before* it and
+    // transmitted as that line's deductionsAmount. "Send every discount
+    // directly after the position it belongs to." Appending all discounts at
+    // the end of the list instead attributes them to the last position, which
+    // is both wrong and can exceed that line's net value (myDATA error 241).
+    const discountTotal =
+      Number(order.discountAmount ?? 0) + Number(order.loyaltyDiscountAmount ?? 0);
+    const grossSum = order.items.reduce((sum, it) => sum + Number(it.lineTotal), 0);
+
+    // Split the discount across the lines in proportion to their value, then
+    // push the rounding remainder onto the largest line so the parts add up to
+    // exactly the discount that was granted.
+    const discountShares: number[] = order.items.map(() => 0);
+    if (discountTotal > 0 && grossSum > 0) {
+      let allocated = 0;
+      order.items.forEach((item, idx) => {
+        const share =
+          Math.round((discountTotal * Number(item.lineTotal) / grossSum) * 100) / 100;
+        // A discount may not exceed the line's own net value (myDATA 241).
+        discountShares[idx] = Math.min(share, Number(item.lineTotal));
+        allocated += discountShares[idx];
+      });
+      const drift = Math.round((discountTotal - allocated) * 100) / 100;
+      if (drift !== 0) {
+        let maxIdx = 0;
+        order.items.forEach((item, idx) => {
+          if (Number(item.lineTotal) > Number(order.items[maxIdx].lineTotal)) maxIdx = idx;
+        });
+        discountShares[maxIdx] = Math.min(
+          Math.round((discountShares[maxIdx] + drift) * 100) / 100,
+          Number(order.items[maxIdx].lineTotal),
+        );
+      }
+    }
+
+    const chargeItems: FtChargeItem[] = [];
+    let position = 0;
+    order.items.forEach((item, idx) => {
       const vatRate = Number(item.taxRateSnapshot);
       const desc = (item.nameSnapshot ?? `Item ${idx + 1}`).slice(0, 200);
       if (!GREEK_VAT_RATES.has(vatRate)) {
@@ -470,14 +510,32 @@ export class MyDataService {
             'Fix the article master data — myDATA will reject this receipt.',
         );
       }
-      return {
+      const itemCase = this.chargeItemCase(vatRate);
+
+      position += 1;
+      chargeItems.push({
         Quantity: Number(item.quantity ?? 1),
         Description: desc,
         Amount: Number(item.lineTotal),
         VATRate: vatRate,
-        Position: idx + 1,
-        ftChargeItemCase: this.chargeItemCase(vatRate),
-      };
+        Position: position,
+        ftChargeItemCase: itemCase,
+      });
+
+      // The discount for this line goes immediately after it, on the same VAT
+      // rate, as a negative amount.
+      const share = discountShares[idx];
+      if (share > 0 && itemCase !== undefined) {
+        position += 1;
+        chargeItems.push({
+          Quantity: 1,
+          Description: 'Discount',
+          Amount: -share,
+          VATRate: vatRate,
+          Position: position,
+          ftChargeItemCase: itemCase | DISCOUNT_FLAG,
+        });
+      }
     });
 
     // Pay Items aus Zahlungen — PaymentMethod is an uppercase enum (CASH, CARD, ...)
@@ -495,37 +553,8 @@ export class MyDataService {
       vatBuckets.set(ci.VATRate, (vatBuckets.get(ci.VATRate) ?? 0) + ci.Amount);
     }
 
-    // Discounts. The order total is already net of discountAmount and
-    // loyaltyDiscountAmount, so without an explicit discount line the charge
-    // items would sum to more than the payment (20.00 goods vs 18.00 paid) and
-    // fiskaltrust's "sum of charge items == sum of pay items" check fails.
-    // A discount is a negative charge item on the same VAT rate.
-    // Source: docs.fiskaltrust.cloud/.../greece/reference-tables/ftchargeitemcase Table 4
-    const discountTotal =
-      Number(order.discountAmount ?? 0) + Number(order.loyaltyDiscountAmount ?? 0);
-    const chargeSum = chargeItems.reduce((sum, ci) => sum + ci.Amount, 0);
-    if (discountTotal > 0 && chargeSum > 0) {
-      let position = chargeItems.length;
-      for (const [vatRate, bucketAmount] of vatBuckets.entries()) {
-        // Split the discount across VAT rates in proportion to each bucket, so
-        // every bucket keeps the tax it actually carries.
-        const share = Math.round((discountTotal * bucketAmount / chargeSum) * 100) / 100;
-        if (share <= 0) continue;
-        const bucketCase = this.chargeItemCase(vatRate);
-        // No valid Greek rate means the article data is wrong; the line was
-        // already logged as such, so do not invent a discount case for it.
-        if (bucketCase === undefined) continue;
-        position += 1;
-        chargeItems.push({
-          Quantity: 1,
-          Description: 'Discount',
-          Amount: -share,
-          VATRate: vatRate,
-          Position: position,
-          ftChargeItemCase: bucketCase | DISCOUNT_FLAG,
-        });
-      }
-    }
+    // Discounts were already emitted directly after their position above — see
+    // the GR rule that a flagged charge item is assigned to the line before it.
     const amounts: FtAmount[] = [...vatBuckets.entries()].map(([rate, amt]) => ({
       ftAmount: amt,
       ftTaxCR: rate,
