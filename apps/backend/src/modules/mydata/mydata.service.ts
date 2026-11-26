@@ -231,6 +231,23 @@ const VAT_NOT_TAXABLE   = 8n; // Not Taxable
 // NOTE: these are rate *codes*, not percentages. The percentage a code stands
 // for is defined by the fiscal VAT-rates table and must not be inferred here.
 
+/**
+ * VAT rates in force in Greece.
+ *
+ * Source: European Commission, "VAT rates applied in EU member countries" —
+ * Greece (EL): standard 24%, reduced 6 / 13 / 17%, super-reduced 4%.
+ * aade.gr/en/.../basic-vat-rates refuses automated requests (403 via Akamai),
+ * so the Commission table is used; it is the reference fiskaltrust links to
+ * from its own GST/VAT documentation.
+ *
+ * Also covered: 9% (island rates, reduced by 30% from 2024/2026) and 0%.
+ *
+ * This set is a local guard only. A rate outside it can never be fiscalised in
+ * Greece, and fiskaltrust only reports that after a full submit round-trip —
+ * which burns retries and hides the real cause, namely wrong article data.
+ */
+const GREEK_VAT_RATES = new Set([0, 4, 6, 9, 13, 17, 24]);
+
 // ftPayItemCase: CCCC_vlll_gggg_xxPP — PP is the payment type byte
 //   01 = cash, 04 = POS/e-POS (card terminal)
 // Source: docs.fiskaltrust.cloud/.../greece/reference-tables/ftpayitemcase
@@ -426,6 +443,17 @@ export class MyDataService {
     const chargeItems: FtChargeItem[] = order.items.map((item, idx) => {
       const vatRate = Number(item.taxRateSnapshot);
       const desc = (item.nameSnapshot ?? `Item ${idx + 1}`).slice(0, 200);
+      if (!GREEK_VAT_RATES.has(vatRate)) {
+        // Wrong article master data cannot be fiscalised: fiskaltrust rejects
+        // the receipt with "VATRate ... is invalid for the given Type of VAT"
+        // only after a full round-trip, which hides the real cause behind
+        // retries. Name the article and the valid rates right here.
+        this.logger.error(
+          `Order ${order.orderNumber}: article "${desc}" carries VAT rate ${vatRate}%, ` +
+            `which does not exist in Greece (valid: ${[...GREEK_VAT_RATES].sort((a, b) => a - b).join(', ')}%). ` +
+            'Fix the article master data — myDATA will reject this receipt.',
+        );
+      }
       return {
         Quantity: Number(item.quantity ?? 1),
         Description: desc,
