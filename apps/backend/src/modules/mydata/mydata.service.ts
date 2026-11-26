@@ -853,6 +853,18 @@ export class MyDataService {
     const mark = markSig?.ftSignature ?? '';
 
     if (!mark) {
+      // The GR documentation states that sandbox queues return the raw myDATA
+      // request and response in ftStateData. That XML is the only place where
+      // we can see which field carries a rejected value (for example an issuer
+      // VAT number that the portal config does not seem to influence), so it is
+      // surfaced on failure instead of being dropped.
+      const stateData = (data as { ftStateData?: unknown }).ftStateData;
+      const stateDataText = typeof stateData === 'string'
+        ? stateData
+        : stateData === undefined || stateData === null
+          ? ''
+          : JSON.stringify(stateData);
+
       // Dump what the middleware actually booked. The echo carries the amounts,
       // which is the only server-side proof of what the ReceiptJournal shows.
       throw new Error(
@@ -860,7 +872,8 @@ export class MyDataService {
         `Raw ftSignatures: ${sigs.map(s => JSON.stringify(s)).join(' | ') || '<none>'}. ` +
         `ftState: ${exactState ?? data.ftState ?? '<none>'}. ` +
         `Booked charge items: ${JSON.stringify(data.ftChargeItems ?? [])}. ` +
-        `Booked pay items: ${JSON.stringify(data.ftPayItems ?? [])}.`,
+        `Booked pay items: ${JSON.stringify(data.ftPayItems ?? [])}. ` +
+        `ftStateData: ${stateDataText ? stateDataText.slice(0, 6000) : '<none>'}.`,
       );
     }
 
