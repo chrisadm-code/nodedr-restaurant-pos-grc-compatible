@@ -18,8 +18,12 @@ const SANDBOX_URL = 'https://pos-api-sandbox.fiskaltrust.cloud';
 const PROD_URL = 'https://pos-api.fiskaltrust.cloud';
 
 const COUNTRY_GR = 0x4752000000000000n;
-const CHARGE_ITEM_BASE = COUNTRY_GR | 0x2000000000000000n;
-const RECEIPT_CASE_POS_RECEIPT = COUNTRY_GR | 0x2000000000000001n;
+// Version nibble sits in bits 61-64 (0x0000_2000_0000_0000). The older
+// 0x2000_0000_0000_0000 mask set bit 62 and corrupted the country code to
+// 0x6752, which fiskaltrust rejects as an invalid case value.
+const CHARGE_ITEM_BASE = COUNTRY_GR | 0x0000200000000010n;
+const RECEIPT_CASE_POS_RECEIPT = COUNTRY_GR | 0x0000200000000001n;
+const PAY_CASH = COUNTRY_GR | 0x0000200000000001n;
 
 /** VAT nibble derived by the service for a Greek tax rate. */
 const VAT_NORMAL = 3n; // 24%
@@ -555,7 +559,7 @@ describe('MyDataService — BigInt transport', () => {
         ftPayLine: 1,
         ftPayText: 'CASH',
         ftPayAmount: 100,
-        ftPayItemCase: (COUNTRY_GR | 0x2000000000000001n).toString(),
+        ftPayItemCase: PAY_CASH.toString(),
       },
     ]),
     tableArea: null,
@@ -588,8 +592,8 @@ describe('MyDataService — BigInt transport', () => {
     const expectedCase = (CHARGE_ITEM_BASE | VAT_NORMAL).toString();
     const expectedReceiptCase = RECEIPT_CASE_POS_RECEIPT.toString();
     expect(rawBody).toContain(`"ftChargeItemCase":${expectedCase}`);
-    expect(rawBody).toContain(`"cbReceiptCase":${expectedReceiptCase}`);
-    expect(rawBody).toContain(`"ftPayItemCase":${(COUNTRY_GR | 0x2000000000000001n).toString()}`);
+    expect(rawBody).toContain(`"ftReceiptCase":${expectedReceiptCase}`);
+    expect(rawBody).toContain(`"ftPayItemCase":${PAY_CASH.toString()}`);
     // No quoted occurrences of the case values anywhere in the body.
     expect(rawBody).not.toContain(`"ftChargeItemCase":"${expectedCase}"`);
     // ...and provably NOT what a Number would have produced. These Int64 values

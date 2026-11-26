@@ -83,13 +83,19 @@ type Tx = Prisma.TransactionClient;
  */
 interface FtPosRequest {
   ftCashBoxID: string;
-  ftQueueID: string;
+  ftQueueID?: string; // optional routing instruction (null in v2 when unset)
   ftPosSystemId?: string; // identifies the POS software — checked by Portal basic receipt validation
   cbTerminalID: string;
   cbReceiptReference: string;
   cbReceiptMoment: string; // ISO 8601
-  cbReceiptCase: bigint;
-  cbReceiptAmounts?: FtAmount[];
+  // PosSystem API v2 names this field ftReceiptCase (uint64). The v0 name
+  // cbReceiptCase is not part of the v2 model: sending it leaves ftReceiptCase
+  // at its default 0, which the Portal validation reports as "ReceiptCase
+  // invalid" for every receipt.
+  ftReceiptCase: bigint;
+  // v0's cbReceiptAmounts[] array does not exist in v2 — the request carries
+  // one optional gross total instead.
+  cbReceiptAmount?: number;
   cbChargeItems?: FtChargeItem[];
   cbPayItems?: FtPayItem[];
   cbArea?: string; // table number for restaurant orders (8.6)
@@ -102,21 +108,22 @@ interface FtAmount {
 }
 
 interface FtChargeItem {
-  ftChargeLine: number;
-  ftChargeText?: string;
-  // PosSystem API v2 validates cbChargeItems[].Description (must not be empty);
-  // ftChargeText alone is not read by the v2 model.
-  Description?: string;
-  ftChargeAmount: number;
+  // v2 ChargeItem requires Quantity, Description, Amount and VATRate.
+  // Amount defaults to 0 when omitted — that is why v0-style ftChargeAmount
+  // payloads showed 0 EUR for every receipt in the ReceiptJournal.
+  Quantity: number;
+  Description: string;
+  Amount: number;
+  VATRate: number;
+  Position?: number;
   ftChargeItemCase?: bigint; // carries VAT rate + service type
   ftChargeItemCaseData?: unknown;
 }
 
 interface FtPayItem {
-  ftPayLine: number;
-  ftPayText?: string;
-  Description?: string;
-  ftPayAmount: number;
+  Description: string;
+  Amount: number;
+  Position?: number;
   ftPayItemCase?: bigint;
 }
 
@@ -182,17 +189,22 @@ const COUNTRY_GR = 0x4752000000000000n;
 
 // Receipt cases — version 2, POS receipt (retail sale, myDATA 11.1)
 // Format: CCCC_vlll_gggg_txcc
-//   v=2 (version 2), t=0 (receipt), xcc=0001 (POS receipt)
-const RECEIPT_CASE_POS_RECEIPT = COUNTRY_GR | 0x2000000000000001n;
+//   CCCC = country (0x4752 = "GR"), v = 2, then llll/gggg flags, txcc = type+case
+// The version nibble sits in bits 61-64 (0x0000_2000_0000_0000). A mask of
+// 0x2000_0000_0000_0000 instead sets bit 62 and corrupts the country code
+// (0x4752 | 0x2000 becomes 0x6752), which fiskaltrust rejects as an invalid
+// ReceiptCase.
+const RECEIPT_CASE_POS_RECEIPT = COUNTRY_GR | 0x0000200000000001n;
 
 // Payment transfer receipt (myDATA 8.4) — used for void/cancel referencing
-const RECEIPT_CASE_VOID = COUNTRY_GR | 0x2000000000000002n;
+const RECEIPT_CASE_VOID = COUNTRY_GR | 0x0000200000000002n;
 
 // ftChargeItemCase: CCCC_vlll_gggg_NNSV
-//   V (low nibble) = VAT rate, S = Service type
-//   S=1 (delivery/goods), V=0
-// Source: docs.fiskaltrust.cloud/.../ftchargeitemcase Table 1 (V) and Table 2 (S)
-const CHARGE_ITEM_BASE = COUNTRY_GR | 0x2000000000000000n; // v=2, NN=00, S=1, V=0
+//   V (lowest nibble) = VAT rate, S (second nibble) = type of service,
+//   NN (bits 8-15) = nature of VAT (00 = usual VAT applies)
+//   S=1 (delivery/supply of goods) therefore sets 0x10, not 0x00.
+// Source: docs.fiskaltrust.cloud/.../greece/reference-tables/ftchargeitemcase
+const CHARGE_ITEM_BASE = COUNTRY_GR | 0x0000200000000010n; // v=2, NN=00, S=1, V=0
 const VAT_NORMAL        = 3n; // Normal VAT rate (24%)
 const VAT_DISCOUNTED_1  = 1n; // Discounted-1 VAT rate (13%)
 const VAT_DISCOUNTED_2  = 2n; // Discounted-2 VAT rate
@@ -200,9 +212,11 @@ const VAT_SUPER_REDUCED = 4n; // Super-reduced-1 VAT rate (6%)
 const VAT_ZERO          = 7n; // Zero VAT rate (0%)
 const VAT_NOT_TAXABLE   = 8n; // Not Taxable
 
-// ftPayItemCase: CCCC_vlll_gggg_xxcc (same structure as receipt case)
-const PAY_CASH = COUNTRY_GR | 0x2000000000000001n; // cash
-const PAY_CARD = COUNTRY_GR | 0x2000000000000010n; // card / EFTPOS
+// ftPayItemCase: CCCC_vlll_gggg_xxPP — PP is the payment type byte
+//   01 = cash, 04 = POS/e-POS (card terminal)
+// Source: docs.fiskaltrust.cloud/.../greece/reference-tables/ftpayitemcase
+const PAY_CASH = COUNTRY_GR | 0x0000200000000001n; // PP=01 cash
+const PAY_CARD = COUNTRY_GR | 0x0000200000000004n; // PP=04 POS/e-POS
 
 const BATCH = 100;
 const API_TIMEOUT = 15_000; // CloudCashbox may take time for myDATA round-trip
@@ -272,6 +286,17 @@ export class MyDataService {
 
   private get apiKey(): string {
     return this.config.getOrThrow<string>('MYDATA_API_KEY');
+  }
+
+  /**
+   * Queue identifier for ftQueueID. ftQueueID is a routing instruction, not the
+   * cash box identity: sending the cashbox GUID makes the field semantically
+   * wrong and hides the real queue. Prefer an explicit MYDATA_QUEUE_ID; the
+   * field stays optional in v2, so an unset value is omitted rather than faked.
+   */
+  private get queueId(): string | undefined {
+    const explicit = this.config.get<string>('MYDATA_QUEUE_ID');
+    return explicit ? explicit.trim() : undefined;
   }
 
   private get vatNumber(): string {
@@ -364,31 +389,33 @@ export class MyDataService {
     // taxRateSnapshot (Decimal), so VAT is derived per-line, not per-order.
     // This matches how verifactu.service.ts handles it (Number(i.taxRateSnapshot)).
     const chargeItems: FtChargeItem[] = order.items.map((item, idx) => {
-      const itemVatV = this.deriveVatV(Number(item.taxRateSnapshot));
+      const vatRate = Number(item.taxRateSnapshot);
+      const itemVatV = this.deriveVatV(vatRate);
       const desc = (item.nameSnapshot ?? `Item ${idx + 1}`).slice(0, 200);
       return {
-        ftChargeLine: idx + 1,
-        ftChargeText: desc,
+        Quantity: Number(item.quantity ?? 1),
         Description: desc,
-        ftChargeAmount: Number(item.lineTotal),
+        Amount: Number(item.lineTotal),
+        VATRate: vatRate,
+        Position: idx + 1,
         ftChargeItemCase: CHARGE_ITEM_BASE | itemVatV,
       };
     });
 
     // Pay Items aus Zahlungen — PaymentMethod is an uppercase enum (CASH, CARD, ...)
     const payItems: FtPayItem[] = order.payments.map((pay, idx) => ({
-      ftPayLine: idx + 1,
-      ftPayText: String(pay.method),
       Description: String(pay.method),
-      ftPayAmount: Number(pay.amount),
+      Amount: Number(pay.amount),
+      Position: idx + 1,
       ftPayItemCase: pay.method === 'CASH' ? PAY_CASH : PAY_CARD,
     }));
 
-    // Aggregate amounts by VAT category for the receipt-level summary
+    // Per-VAT-category totals, kept for local reporting. v2 requests carry a
+    // single gross cbReceiptAmount instead of this v0-style array.
     const vatBuckets = new Map<bigint, number>();
     for (const ci of chargeItems) {
       const v = ci.ftChargeItemCase! & 0xfn;
-      vatBuckets.set(v, (vatBuckets.get(v) ?? 0) + ci.ftChargeAmount);
+      vatBuckets.set(v, (vatBuckets.get(v) ?? 0) + ci.Amount);
     }
     const amounts: FtAmount[] = [...vatBuckets.entries()].map(([v, amt]) => ({
       ftAmount: amt,
@@ -527,23 +554,39 @@ export class MyDataService {
   }): Promise<ReceiptMyData> {
     const amounts: FtAmount[] = JSON.parse(receipt.amounts);
 
-    // Charge/pay items were stored with BigInt case values as strings.
-    const chargeItems = JSON.parse(receipt.chargeItems).map((ci: any) => ({
-      ...ci,
-      Description: ci.Description ?? ci.ftChargeText ?? '',
-      ftChargeItemCase: ci.ftChargeItemCase ? BigInt(ci.ftChargeItemCase) : undefined,
-    }));
-    const payItems = JSON.parse(receipt.payItems).map((pi: any) => ({
-      ...pi,
-      Description: pi.Description ?? pi.ftPayText ?? '',
-      ftPayItemCase: pi.ftPayItemCase ? BigInt(pi.ftPayItemCase) : undefined,
-    }));
+    // Stored line items may be in either shape: rows written before the v2
+    // field fix carry ftChargeLine/ftChargeText/ftChargeAmount, newer rows
+    // carry Quantity/Amount/VATRate. Normalize to the v2 model here so
+    // already-queued receipts submit with real amounts instead of Amount=0.
+    const chargeItems: FtChargeItem[] = JSON.parse(receipt.chargeItems).map(
+      (ci: any, idx: number) => {
+        const itemCase = ci.ftChargeItemCase ? BigInt(ci.ftChargeItemCase) : undefined;
+        return {
+          Quantity: Number(ci.Quantity ?? 1),
+          Description: String(ci.Description ?? ci.ftChargeText ?? ''),
+          Amount: Number(ci.Amount ?? ci.ftChargeAmount ?? 0),
+          // Older rows carry no VATRate. Derive it from the case nibble we
+          // wrote, so Amount and tax rate never contradict each other in v2.
+          VATRate: Number(ci.VATRate ?? this.vatRateFromCase(itemCase)),
+          Position: Number(ci.Position ?? ci.ftChargeLine ?? idx + 1),
+          ftChargeItemCase: itemCase,
+        };
+      },
+    );
+    const payItems: FtPayItem[] = JSON.parse(receipt.payItems).map(
+      (pi: any, idx: number) => ({
+        Description: String(pi.Description ?? pi.ftPayText ?? ''),
+        Amount: Number(pi.Amount ?? pi.ftPayAmount ?? 0),
+        Position: Number(pi.Position ?? pi.ftPayLine ?? idx + 1),
+        ftPayItemCase: pi.ftPayItemCase ? BigInt(pi.ftPayItemCase) : undefined,
+      }),
+    );
 
     const body: FtPosRequest = {
       // PosSystem API v2 validates ftCashBoxID/ftQueueID as GUIDs — header
       // auth already scopes the request, body must carry the cashbox GUID.
       ftCashBoxID: this.cashboxId,
-      ftQueueID: this.cashboxId,
+      ftQueueID: this.queueId,
       // Stable software identity for the Portal's basic receipt validation
       // ("receipts should include the PosSystemId"). Overridable via env.
       ftPosSystemId:
@@ -553,8 +596,12 @@ export class MyDataService {
       cbReceiptReference: receipt.orderNumber,
       // Reuse the original checkout moment so the Belegzeitstempel doesn't drift on retry.
       cbReceiptMoment: receipt.cbReceiptMoment.toISOString(),
-      cbReceiptCase: receipt.receiptCase,
-      cbReceiptAmounts: amounts,
+      ftReceiptCase: receipt.receiptCase,
+      // v2 takes one gross total; the sum of the charge items is the fallback
+      // when no explicit amount is available.
+      cbReceiptAmount:
+        Number(receipt.totalAmount) ||
+        chargeItems.reduce((sum, ci) => sum + ci.Amount, 0),
       cbChargeItems: chargeItems,
       cbPayItems: payItems,
     };
@@ -684,10 +731,11 @@ export class MyDataService {
 
     const cancelBody = {
       ftCashBoxID: this.cashboxId,
-      ftQueueID: this.cashboxId,
+      ...(this.queueId ? { ftQueueID: this.queueId } : {}),
       cbReceiptReference: `CANCEL-${original.orderNumber}`,
       cbReceiptMoment: new Date().toISOString(),
-      cbReceiptCase: RECEIPT_CASE_VOID.toString(),
+      // v2 field name, and Int64 must travel unquoted (see submitReceipt).
+      ftReceiptCase: `@n:${RECEIPT_CASE_VOID.toString()}`,
       ftReceiptCaseData: {
         GR: {
           PreviousReceiptReference: {
@@ -700,12 +748,15 @@ export class MyDataService {
       cbNote: reason ?? 'Storno',
     };
 
-    const res = await fetch(`${this.providerUrl}/v2/sign`, {
+    const cancelRes = await fetch(`${this.providerUrl}/v2/sign`, {
       method: 'POST',
       headers: this.authHeaders(randomUUID()),
-      body: JSON.stringify(cancelBody),
+      // Same Int64 unquoting as submitReceipt: ftReceiptCase must arrive as a
+      // raw JSON number, so the @n: placeholder is stripped of its quotes.
+      body: JSON.stringify(cancelBody).replace(/"@n:(\d+)"/g, '$1'),
       signal: AbortSignal.timeout(API_TIMEOUT),
     });
+    const res = cancelRes;
 
     if (!res.ok) {
       const text = await res.text().catch(() => '');
@@ -761,6 +812,21 @@ export class MyDataService {
     if (rate >= 10) return VAT_DISCOUNTED_1;  // 13%
     if (rate > 0) return VAT_SUPER_REDUCED;   // 6%
     return VAT_ZERO;                           // 0%
+  }
+
+  /**
+   * Inverse of deriveVatV: the Greek VAT percentage behind a V nibble. Used to
+   * fill VATRate for receipts queued before VATRate was transmitted at all.
+   */
+  private vatRateFromCase(itemCase: bigint | undefined): number {
+    if (!itemCase) return 0;
+    switch (itemCase & 0xfn) {
+      case VAT_NORMAL: return 24;
+      case VAT_DISCOUNTED_1: return 13;
+      case VAT_DISCOUNTED_2: return 13;
+      case VAT_SUPER_REDUCED: return 6;
+      default: return 0; // zero rate / not taxable
+    }
   }
 
   /**
