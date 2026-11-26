@@ -675,3 +675,116 @@ describe('MyDataService.stats', () => {
     expect(prisma.myDataReceipt.count.mock.calls[0][0].where).toEqual({});
   });
 });
+
+describe('MyDataService.recordRefund', () => {
+  // IsReturn/IsRefund at receipt level sits at gggg 0x0100 (bits 16-19).
+  const RECEIPT_CASE_REFUND =
+    COUNTRY_GR | 0x0000200000000000n | (0x0100n << 16n) | 0x0001n;
+  // Item-level IsReturn/IsRefund: gggg 0x0002.
+  const ITEM_RETURN_FLAG = 0x0000000000020000n;
+
+  const refundOrder = {
+    id: 'o1',
+    orderNumber: 'ORD-1001',
+    branchId: 'b1',
+    totalAmount: 124,
+    items: [
+      { id: 'i1', nameSnapshot: 'Souvlaki', lineTotal: 100, quantity: 1, taxRateSnapshot: 24 },
+      { id: 'i2', nameSnapshot: 'Water', lineTotal: 24, quantity: 1, taxRateSnapshot: 0 },
+    ],
+  };
+
+  const saleReceipt = {
+    id: 'sale-1',
+    orderNumber: 'ORD-1001',
+    mark: '400001234567890',
+  };
+
+  function refundTx(sale: unknown = saleReceipt) {
+    const create = jest.fn().mockResolvedValue({});
+    const findFirst = jest
+      .fn()
+      // first call: has this refund already been fiscalised?
+      .mockResolvedValueOnce(null)
+      // second call: the sale receipt being reversed
+      .mockResolvedValueOnce(sale);
+    return {
+      tx: {
+        order: { findUniqueOrThrow: jest.fn().mockResolvedValue(refundOrder) },
+        myDataReceipt: { create, findFirst },
+      } as never,
+      create,
+      findFirst,
+    };
+  }
+
+  it('writes a REFUND document with IsReturn/IsRefund and inverted lines', async () => {
+    const { svc } = build();
+    const { tx, create } = refundTx();
+    await svc.recordRefund(tx, 'o1', 'r1', 124, 'CASH');
+
+    expect(create).toHaveBeenCalledTimes(1);
+    const data = create.mock.calls[0][0].data;
+
+    expect(data.documentType).toBe('REFUND');
+    expect(data.refundId).toBe('r1');
+    expect(data.originalReceiptId).toBe('sale-1');
+    expect(data.status).toBe('PENDING');
+    // Full refund carries the receipt-level flag.
+    expect(data.receiptCase).toBe(RECEIPT_CASE_REFUND);
+
+    const items = JSON.parse(data.chargeItems);
+    expect(items.map((ci: { Amount: number }) => ci.Amount)).toEqual([-100, -24]);
+    // Every returned line carries the item flag; that is what makes it a return.
+    for (const ci of items) {
+      expect(BigInt(ci.ftChargeItemCase) & ITEM_RETURN_FLAG).toBe(ITEM_RETURN_FLAG);
+    }
+
+    // money out is a pay item, also flagged as a return (it was collected once)
+    const pays = JSON.parse(data.payItems);
+    expect(pays).toHaveLength(1);
+    expect(pays[0].Amount).toBe(-124);
+    expect(BigInt(pays[0].ftPayItemCase) & ITEM_RETURN_FLAG).toBe(ITEM_RETURN_FLAG);
+  });
+
+  it('keeps the sale receipt type and only returns the units handed back', async () => {
+    const { svc } = build();
+    const { tx, create } = refundTx();
+    await svc.recordRefund(tx, 'o1', 'r2', 100, 'CASH', [
+      { orderItemId: 'i1', quantity: 1 },
+    ]);
+
+    const data = create.mock.calls[0][0].data;
+    // A partial refund leaves the receipt-level flag off and relies on the
+    // item flags (GR docs, Table 3).
+    expect(data.receiptCase).toBe(RECEIPT_CASE_POS_RECEIPT);
+
+    const items = JSON.parse(data.chargeItems);
+    expect(items).toHaveLength(1);
+    expect(items[0].Description).toBe('Souvlaki');
+    expect(items[0].Amount).toBe(-100);
+  });
+
+  it('writes nothing when the sale was never fiscalised', async () => {
+    const { svc } = build();
+    const { tx, create } = refundTx(null);
+    await svc.recordRefund(tx, 'o1', 'r3', 124, 'CASH');
+
+    // A refund referencing a document the authority never saw is worse than
+    // no document at all.
+    expect(create).not.toHaveBeenCalled();
+  });
+
+  it('is idempotent: a replayed refund writes no second document', async () => {
+    const { svc } = build();
+    const create = jest.fn().mockResolvedValue({});
+    const findFirst = jest.fn().mockResolvedValueOnce({ id: 'already' });
+    const tx = {
+      order: { findUniqueOrThrow: jest.fn() },
+      myDataReceipt: { create, findFirst },
+    } as never;
+
+    await svc.recordRefund(tx, 'o1', 'r1', 124, 'CASH');
+    expect(create).not.toHaveBeenCalled();
+  });
+});
