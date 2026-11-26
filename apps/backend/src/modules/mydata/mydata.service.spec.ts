@@ -140,7 +140,7 @@ describe('MyDataService.recordPaidOrder', () => {
     expect(prodCreate.create.mock.calls[0][0].data.sandbox).toBe(false);
   });
 
-  it('leaves the VAT rate code to the middleware and transmits the real rate', async () => {
+  it('maps each Greek VAT rate to its rate code and transmits the real rate', async () => {
     const { svc } = build();
     const { tx, create } = txWith({
       ...order,
@@ -157,19 +157,25 @@ describe('MyDataService.recordPaidOrder', () => {
     const data = create.mock.calls[0][0].data;
     const chargeItems = JSON.parse(data.chargeItems);
 
-    // The V nibble stays 0 (unknown) for every line: the documentation states
-    // the rate is resolved from the VAT-rates table using VATRate. Encoding a
-    // percentage-to-code guess here made fiskaltrust reject the receipt with
-    // "VATRate '6' is invalid for the given Type of VAT '...0004'".
+    // The V nibble must carry a real rate code. An explicit 0 ("Unknown") is
+    // rejected by the middleware with "The VAT Rate ... with VAT type
+    // 0x0000-Unknown ... is not supported", so the code is derived from the
+    // percentage: 24 -> Normal(3), 13 -> Discounted-1(1), 6 -> Discounted-2(2),
+    // 0 -> Zero(7).
+    expect(
+      chargeItems.map((ci: { ftChargeItemCase: string }) =>
+        (BigInt(ci.ftChargeItemCase) & 0xfn).toString(),
+      ),
+    ).toEqual(['3', '1', '2', '7']);
+
     for (const ci of chargeItems) {
-      expect(BigInt(ci.ftChargeItemCase) & 0xfn).toBe(0n);
       expect(BigInt(ci.ftChargeItemCase) & CHARGE_ITEM_BASE).toBe(
         CHARGE_ITEM_BASE,
       );
     }
 
-    // The percentage itself must survive untouched — it is the value the
-    // middleware validates against its own rate table.
+    // The percentage itself must survive untouched — the middleware validates
+    // it against its own rate table.
     expect(chargeItems.map((ci: { VATRate: number }) => ci.VATRate)).toEqual([
       24, 13, 6, 0,
     ]);
@@ -559,6 +565,10 @@ describe('MyDataService — BigInt transport', () => {
         ftChargeAmount: 100,
         // stored as a decimal string, as recordPaidOrder writes it
         ftChargeItemCase: (CHARGE_ITEM_BASE | VAT_NORMAL).toString(),
+        // The submit path rebuilds the case from the real rate, so the fixture
+        // has to carry it; without VATRate the rate would be read from the
+        // order (mocked as empty) and the line would fall to the zero code.
+        VATRate: 24,
       },
     ]),
     payItems: JSON.stringify([
@@ -596,11 +606,10 @@ describe('MyDataService — BigInt transport', () => {
     // quoted strings. Check the raw body text, because JSON.parse itself
     // would already collapse precision beyond 2^53.
     const rawBody: string = fetchMock.mock.calls[0][1].body;
-    // The stored case in this fixture still carries a V nibble (VAT_NORMAL) from
-    // the old percentage mapping. It must be dropped on the way out: v2 resolves
-    // the rate code from VATRate, and a stale V made fiskaltrust reject the
-    // receipt as an invalid VAT type.
-    const expectedCase = CHARGE_ITEM_BASE.toString();
+    // The submit path rebuilds the charge case from the stored VATRate (24%),
+    // so the line goes out as the Normal rate code while keeping every digit of
+    // the Int64 intact.
+    const expectedCase = (CHARGE_ITEM_BASE | VAT_NORMAL).toString();
     const expectedReceiptCase = RECEIPT_CASE_POS_RECEIPT.toString();
     expect(rawBody).toContain(`"ftChargeItemCase":${expectedCase}`);
     expect(rawBody).toContain(`"ftReceiptCase":${expectedReceiptCase}`);

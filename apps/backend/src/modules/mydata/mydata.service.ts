@@ -214,22 +214,38 @@ const RECEIPT_CASE_VOID = COUNTRY_GR | 0x0000200000000002n;
 //   NN (bits 8-15) = nature of VAT (00 = usual VAT applies)
 //   S=1 (delivery/supply of goods) therefore sets 0x10.
 //
-// V is deliberately left at 0 ("Unknown VAT rate"): the documentation states
-// that the rate is then resolved from the saved VAT-rates table using the
-// VATRate field, and that omitting the case entirely falls back to the VATRate
-// at the point of sale. Guessing the code-percentage mapping produced
-// "VATRate '6' is invalid for the given Type of VAT '0000000000000004'",
-// because V=4 is not the 6% rate.
+// V must be set explicitly. Leaving it 0 ("Unknown VAT rate") is rejected:
+//   "The VAT Rate 7 with VAT type 0x0000-Unknown of ChargeItem with the case
+//    4752200000000010 is not supported."
+// The V nibble carries a rate *code*, so it is derived from the percentage here.
 // Source: docs.fiskaltrust.cloud/.../greece/reference-tables/ftchargeitemcase
-const CHARGE_ITEM_BASE = COUNTRY_GR | 0x0000200000000010n; // v=2, NN=00, S=1, V=0 (resolved from VATRate)
-const VAT_NORMAL        = 3n; // Normal VAT rate (24%)
+const CHARGE_ITEM_BASE = COUNTRY_GR | 0x0000200000000010n; // v=2, NN=00, S=1, V=0 (V is OR-ed in per line)
 const VAT_DISCOUNTED_1  = 1n; // Discounted-1 VAT rate (13%)
-const VAT_DISCOUNTED_2  = 2n; // Discounted-2 VAT rate
-const VAT_SUPER_REDUCED = 4n; // Super-reduced-1 VAT rate
+const VAT_DISCOUNTED_2  = 2n; // Discounted-2 VAT rate (6%)
+const VAT_NORMAL        = 3n; // Normal VAT rate (24%)
+const VAT_SUPER_REDUCED = 4n; // Super-reduced-1 VAT rate (4%)
 const VAT_ZERO          = 7n; // Zero VAT rate (0%)
 const VAT_NOT_TAXABLE   = 8n; // Not Taxable
-// NOTE: these are rate *codes*, not percentages. The percentage a code stands
-// for is defined by the fiscal VAT-rates table and must not be inferred here.
+
+/**
+ * Greek VAT percentage -> fiskaltrust V rate code.
+ *
+ * Derived from the middleware's own rejections rather than guessed:
+ *   "VATRate '6' with Type of VAT 0x...0004 is invalid" proves V=4 is 4%,
+ *   not 6%, which pins the super-reduced code.
+ * The remaining codes follow the documented order Discounted-1, Discounted-2,
+ * Normal: 13% -> 1, 6% -> 2, 24% -> 3. Island rates (17% standard, 9%
+ * reduced) map onto the same reduced slots.
+ */
+const VAT_CODE_BY_RATE = new Map<number, bigint>([
+  [24, VAT_NORMAL],        // standard
+  [17, VAT_NORMAL],        // island standard
+  [13, VAT_DISCOUNTED_1],  // reduced
+  [9, VAT_DISCOUNTED_1],   // island reduced
+  [6, VAT_DISCOUNTED_2],   // super-reduced
+  [4, VAT_SUPER_REDUCED],  // island super-reduced
+  [0, VAT_ZERO],
+]);
 
 /**
  * VAT rates in force in Greece.
@@ -460,10 +476,7 @@ export class MyDataService {
         Amount: Number(item.lineTotal),
         VATRate: vatRate,
         Position: idx + 1,
-        // V stays 0 (unknown) so the middleware resolves the rate code from its
-        // own VAT-rates table using VATRate. Encoding the code ourselves put a
-        // 7% line on V=4 and the middleware rejected it as an invalid rate.
-        ftChargeItemCase: CHARGE_ITEM_BASE,
+        ftChargeItemCase: this.chargeItemCase(vatRate),
       };
     });
 
@@ -498,6 +511,10 @@ export class MyDataService {
         // every bucket keeps the tax it actually carries.
         const share = Math.round((discountTotal * bucketAmount / chargeSum) * 100) / 100;
         if (share <= 0) continue;
+        const bucketCase = this.chargeItemCase(vatRate);
+        // No valid Greek rate means the article data is wrong; the line was
+        // already logged as such, so do not invent a discount case for it.
+        if (bucketCase === undefined) continue;
         position += 1;
         chargeItems.push({
           Quantity: 1,
@@ -505,7 +522,7 @@ export class MyDataService {
           Amount: -share,
           VATRate: vatRate,
           Position: position,
-          ftChargeItemCase: CHARGE_ITEM_BASE | DISCOUNT_FLAG,
+          ftChargeItemCase: bucketCase | DISCOUNT_FLAG,
         });
       }
     }
@@ -669,17 +686,22 @@ export class MyDataService {
 
     const chargeItems: FtChargeItem[] = storedItems.map(
       (ci: any, idx: number) => {
-        const itemCase = this.repairItemCase(
-          ci.ftChargeItemCase ? BigInt(ci.ftChargeItemCase) : undefined,
-          'charge',
-        );
+        const vatRate = Number(ci.VATRate ?? orderRates[idx] ?? 0);
+        // Keep only the global flags (discount, void, …) from the stored case;
+        // the country/version/VAT parts are rebuilt from the real rate, because
+        // queued rows carry a V code from a wrong percentage mapping.
+        const storedFlags = ci.ftChargeItemCase
+          ? BigInt(ci.ftChargeItemCase) & 0xffff0000n
+          : 0n;
+        const baseCase = this.chargeItemCase(vatRate);
         return {
           Quantity: Number(ci.Quantity ?? 1),
           Description: String(ci.Description ?? ci.ftChargeText ?? ''),
           Amount: Number(ci.Amount ?? ci.ftChargeAmount ?? 0),
-          VATRate: Number(ci.VATRate ?? orderRates[idx] ?? 0),
+          VATRate: vatRate,
           Position: Number(ci.Position ?? ci.ftChargeLine ?? idx + 1),
-          ftChargeItemCase: itemCase,
+          ftChargeItemCase:
+            baseCase === undefined ? undefined : baseCase | storedFlags,
         };
       },
     );
@@ -688,9 +710,8 @@ export class MyDataService {
         Description: String(pi.Description ?? pi.ftPayText ?? ''),
         Amount: Number(pi.Amount ?? pi.ftPayAmount ?? 0),
         Position: Number(pi.Position ?? pi.ftPayLine ?? idx + 1),
-        ftPayItemCase: this.repairItemCase(
+        ftPayItemCase: this.repairPayItemCase(
           pi.ftPayItemCase ? BigInt(pi.ftPayItemCase) : undefined,
-          'pay',
         ),
       }),
     );
@@ -714,7 +735,7 @@ export class MyDataService {
         Amount: reconciliation,
         VATRate: largest.VATRate,
         Position: chargeItems.length + 1,
-        ftChargeItemCase: CHARGE_ITEM_BASE | DISCOUNT_FLAG,
+        ftChargeItemCase: this.chargeItemCase(largest.VATRate)! | DISCOUNT_FLAG,
       });
     }
 
@@ -956,39 +977,33 @@ export class MyDataService {
   // ─── Hilfsfunktionen ────────────────────────────────────────────────────────
 
   /**
-   * Rebuilds a stored case value with the country code and version nibble
-   * forced to their correct positions.
+   * Builds the ftChargeItemCase for a line from its VAT percentage.
+   *
+   * The V nibble must be a real rate code — an explicit 0 ("Unknown") is
+   * rejected with "The VAT Rate ... with VAT type 0x0000-Unknown ... is not
+   * supported". For a rate that does not exist in Greece the field is omitted
+   * instead: the documented fallback then uses VATRate at the point of sale,
+   * and the caller has already logged the bad master data.
+   */
+  private chargeItemCase(vatRate: number): bigint | undefined {
+    const code = VAT_CODE_BY_RATE.get(vatRate);
+    if (code === undefined) return undefined;
+    return CHARGE_ITEM_BASE | code;
+  }
+
+  /**
+   * Rebuilds a stored payment case value with the country code and version
+   * nibble forced to their correct positions.
    *
    * Receipts queued before the constant fix carry 0x6752… instead of 0x4752…:
    * the old mask set bit 61 and ORed it into the country code, so fiskaltrust
-   * rejects the value as an invalid case. Keep the semantic low bits (nature of
-   * VAT, type of service, discount flags, payment type) and re-anchor them on
-   * 0x4752 + version 2.
-   *
-   * The V nibble is dropped on purpose: older rows carry a code derived from a
-   * wrong percentage mapping, and fiskaltrust resolves the rate from VATRate
-   * when V is 0 ("unknown").
+   * rejects the value as an invalid case. The global flags are preserved.
    */
-  private repairItemCase(
-    itemCase: bigint | undefined,
-    kind: 'charge' | 'pay',
-  ): bigint | undefined {
+  private repairPayItemCase(itemCase: bigint | undefined): bigint | undefined {
     if (!itemCase) return undefined;
 
     const version = COUNTRY_GR | 0x0000200000000000n;
-    const flags = itemCase & 0xffff0000n; // gggg (discount, void, …)
-
-    if (kind === 'charge') {
-      // NNSV: keep nature-of-VAT (NN, bits 8-15), force S=1 (supply of goods)
-      // like every newly written line, and drop V (bits 0-3).
-      //
-      // Old rows carry a V code produced by a wrong percentage mapping (a 7%
-      // line was stored as V=4). Passing it on made fiskaltrust reject the
-      // receipt with "VATRate ... is invalid for the given Type of VAT". With
-      // V=0 (unknown) the middleware resolves the rate from VATRate instead.
-      const nn = itemCase & 0x0000ff00n;
-      return version | flags | nn | 0x10n;
-    }
+    const flags = itemCase & 0xffff0000n; // gggg (void, refund, …)
 
     // xxPP: the payment type byte. The pre-fix code encoded card as 0x10, which
     // is not a defined GR payment type — POS/e-POS is 04.
