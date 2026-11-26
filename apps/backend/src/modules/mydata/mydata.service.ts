@@ -218,6 +218,12 @@ const VAT_NOT_TAXABLE   = 8n; // Not Taxable
 const PAY_CASH = COUNTRY_GR | 0x0000200000000001n; // PP=01 cash
 const PAY_CARD = COUNTRY_GR | 0x0000200000000004n; // PP=04 POS/e-POS
 
+// Global flag (gggg) marking a charge item as a discount line (= 0x0004 at
+// hex positions 9-12, i.e. bits 16-19). A discount is a negative amount on the
+// same VAT rate as the discounted lines.
+// Source: docs.fiskaltrust.cloud/.../greece/reference-tables/ftchargeitemcase Table 4
+const DISCOUNT_FLAG = 0x0000000000040000n;
+
 const BATCH = 100;
 const API_TIMEOUT = 15_000; // CloudCashbox may take time for myDATA round-trip
 const MAX_RETRIES = 10;     // before a PENDING receipt moves to FAILED
@@ -417,6 +423,34 @@ export class MyDataService {
       const v = ci.ftChargeItemCase! & 0xfn;
       vatBuckets.set(v, (vatBuckets.get(v) ?? 0) + ci.Amount);
     }
+
+    // Discounts. The order total is already net of discountAmount and
+    // loyaltyDiscountAmount, so without an explicit discount line the charge
+    // items would sum to more than the payment (20.00 goods vs 18.00 paid) and
+    // fiskaltrust's "sum of charge items == sum of pay items" check fails.
+    // A discount is a negative charge item on the same VAT rate.
+    // Source: docs.fiskaltrust.cloud/.../greece/reference-tables/ftchargeitemcase Table 4
+    const discountTotal =
+      Number(order.discountAmount ?? 0) + Number(order.loyaltyDiscountAmount ?? 0);
+    const chargeSum = chargeItems.reduce((sum, ci) => sum + ci.Amount, 0);
+    if (discountTotal > 0 && chargeSum > 0) {
+      let position = chargeItems.length;
+      for (const [vat, bucketAmount] of vatBuckets.entries()) {
+        // Split the discount across VAT rates in proportion to each bucket, so
+        // every bucket keeps the tax it actually carries.
+        const share = Math.round((discountTotal * bucketAmount / chargeSum) * 100) / 100;
+        if (share <= 0) continue;
+        position += 1;
+        chargeItems.push({
+          Quantity: 1,
+          Description: 'Discount',
+          Amount: -share,
+          VATRate: this.vatRateFromCase(vat),
+          Position: position,
+          ftChargeItemCase: CHARGE_ITEM_BASE | vat | DISCOUNT_FLAG,
+        });
+      }
+    }
     const amounts: FtAmount[] = [...vatBuckets.entries()].map(([v, amt]) => ({
       ftAmount: amt,
       ftTaxCR: Number(v),
@@ -560,7 +594,10 @@ export class MyDataService {
     // already-queued receipts submit with real amounts instead of Amount=0.
     const chargeItems: FtChargeItem[] = JSON.parse(receipt.chargeItems).map(
       (ci: any, idx: number) => {
-        const itemCase = ci.ftChargeItemCase ? BigInt(ci.ftChargeItemCase) : undefined;
+        const itemCase = this.repairItemCase(
+          ci.ftChargeItemCase ? BigInt(ci.ftChargeItemCase) : undefined,
+          'charge',
+        );
         return {
           Quantity: Number(ci.Quantity ?? 1),
           Description: String(ci.Description ?? ci.ftChargeText ?? ''),
@@ -578,9 +615,35 @@ export class MyDataService {
         Description: String(pi.Description ?? pi.ftPayText ?? ''),
         Amount: Number(pi.Amount ?? pi.ftPayAmount ?? 0),
         Position: Number(pi.Position ?? pi.ftPayLine ?? idx + 1),
-        ftPayItemCase: pi.ftPayItemCase ? BigInt(pi.ftPayItemCase) : undefined,
+        ftPayItemCase: this.repairItemCase(
+          pi.ftPayItemCase ? BigInt(pi.ftPayItemCase) : undefined,
+          'pay',
+        ),
       }),
     );
+
+    // v2 requires sum(chargeItems) == sum(payItems); fiskaltrust's basic
+    // receipt check reports a mismatch on the receipt. Receipts queued before
+    // discounts were transmitted carry the gross item sum but the discounted
+    // payment, so reconcile with an explicit negative discount line instead of
+    // shipping a receipt that fails validation.
+    const chargeSum = chargeItems.reduce((sum, ci) => sum + ci.Amount, 0);
+    const paySum = payItems.reduce((sum, pi) => sum + pi.Amount, 0);
+    const reconciliation = Math.round((paySum - chargeSum) * 100) / 100;
+    if (reconciliation < 0) {
+      const largest = chargeItems.reduce(
+        (max, ci) => (ci.Amount > max.Amount ? ci : max),
+        chargeItems[0],
+      );
+      chargeItems.push({
+        Quantity: 1,
+        Description: 'Discount',
+        Amount: reconciliation,
+        VATRate: largest.VATRate,
+        Position: chargeItems.length + 1,
+        ftChargeItemCase: CHARGE_ITEM_BASE | (largest.ftChargeItemCase! & 0xfn) | DISCOUNT_FLAG,
+      });
+    }
 
     const body: FtPosRequest = {
       // PosSystem API v2 validates ftCashBoxID/ftQueueID as GUIDs — header
@@ -827,6 +890,40 @@ export class MyDataService {
       case VAT_SUPER_REDUCED: return 6;
       default: return 0; // zero rate / not taxable
     }
+  }
+
+  /**
+   * Rebuilds a stored case value with the country code and version nibble
+   * forced to their correct positions.
+   *
+   * Receipts queued before the constant fix carry 0x6752… instead of 0x4752…:
+   * the old mask set bit 61 and ORed it into the country code, so fiskaltrust
+   * rejects the value as an invalid case. Keep the semantic low bits (nature of
+   * VAT, type of service, discount flags, payment type) and re-anchor them on
+   * 0x4752 + version 2.
+   */
+  private repairItemCase(
+    itemCase: bigint | undefined,
+    kind: 'charge' | 'pay',
+  ): bigint | undefined {
+    if (!itemCase) return undefined;
+
+    const version = COUNTRY_GR | 0x0000200000000000n;
+    const flags = itemCase & 0xffff0000n; // gggg (discount, void, …)
+
+    if (kind === 'charge') {
+      // NNSV: keep nature-of-VAT (NN, bits 8-15) and VAT rate (V, bits 0-3),
+      // force S=1 (supply of goods) like every newly written line.
+      const nn = itemCase & 0x0000ff00n;
+      const vat = itemCase & 0x0fn;
+      return version | flags | nn | 0x10n | vat;
+    }
+
+    // xxPP: the payment type byte. The pre-fix code encoded card as 0x10, which
+    // is not a defined GR payment type — POS/e-POS is 04.
+    let pp = Number(itemCase & 0xffn);
+    if (pp === 0x10) pp = 0x04;
+    return version | flags | BigInt(pp);
   }
 
   /**
