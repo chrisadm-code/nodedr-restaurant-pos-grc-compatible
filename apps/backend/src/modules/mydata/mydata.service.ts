@@ -100,6 +100,15 @@ interface FtPosRequest {
   cbPayItems?: FtPayItem[];
   cbArea?: string; // table number for restaurant orders (8.6)
   cbCustomer?: FtCustomer;
+  // References the original receipt of this queue. A refund of a paid sale must
+  // carry it: the Middleware then transmits the original MARK as
+  // correlatedInvoices / multipleConnectedMarks, which is what myDATA needs to
+  // link a correction to the document it corrects.
+  // Source: GR data-structures → ftReceiptCaseData.GR.PreviousReceiptReference
+  cbPreviousReceiptReference?: string;
+  // Market-specific receipt payload. For GR refunds it carries the MARK of the
+  // document being reversed (PreviousReceiptReference.invoiceMark).
+  ftReceiptCaseData?: unknown;
 }
 
 interface FtAmount {
@@ -132,6 +141,10 @@ interface FtCustomer {
   CustomerName?: string;
   CustomerZip?: string;
   CustomerCity?: string;
+  CustomerStreet?: string;
+  // Greek AFM. Required by myDATA for invoices (B2B) and read for the
+  // counterpart of a document; a business customer is identified by it.
+  CustomerVATId?: string;
 }
 
 /**
@@ -206,8 +219,25 @@ const COUNTRY_GR = 0x4752000000000000n;
 // ReceiptCase.
 const RECEIPT_CASE_POS_RECEIPT = COUNTRY_GR | 0x0000200000000001n;
 
-// Payment transfer receipt (myDATA 8.4) — used for void/cancel referencing
-const RECEIPT_CASE_VOID = COUNTRY_GR | 0x0000200000000002n;
+// Correction flags live in the global tagging section gggg (bits 16-19) of
+// every case value. Receipt level: IsVoid 0x0004 reverses a receipt where
+// neither goods nor money changed hands, IsReturn/IsRefund 0x0100 reverses an
+// already paid sale as a NEW business case.
+// Source: docs.fiskaltrust.cloud/.../general/reference-tables — PosReceipt
+// (Invoice only) flags, and general/cash-register-integration/refunds-and-voids.
+const RECEIPT_FLAG_IS_VOID = 0x0004n;
+const RECEIPT_FLAG_IS_RETURN = 0x0100n;
+
+// Refund of an already paid sale: POS receipt type plus IsReturn/IsRefund,
+// which myDATA reports as document type 11.4. The original sale stays on record.
+const RECEIPT_CASE_REFUND =
+  COUNTRY_GR | 0x0000200000000000n | (RECEIPT_FLAG_IS_RETURN << 16n) | 0x0001n;
+
+// Void of a POS receipt that was never paid (technical problem). A paid sale
+// must never use this — the documentation is explicit that void misrepresents
+// a completed business case.
+const RECEIPT_CASE_VOID =
+  COUNTRY_GR | 0x0000200000000000n | (RECEIPT_FLAG_IS_VOID << 16n) | 0x0001n;
 
 // ftChargeItemCase: CCCC_vlll_gggg_NNSV
 //   V (lowest nibble) = VAT rate code, S (second nibble) = type of service,
@@ -275,6 +305,12 @@ const PAY_CARD = COUNTRY_GR | 0x0000200000000004n; // PP=04 POS/e-POS
 // same VAT rate as the discounted lines.
 // Source: docs.fiskaltrust.cloud/.../greece/reference-tables/ftchargeitemcase Table 4
 const DISCOUNT_FLAG = 0x0000000000040000n;
+
+// Charge and pay item flag (gggg) marking an item as returned: "Quantity and
+// amount are inverted, related to the original item." Only the items actually
+// handed back carry it; that is what separates a partial refund from a full one.
+// Source: .../greece/reference-tables/ftchargeitemcase and ftpayitemcase Table 4
+const ITEM_RETURN_FLAG = 0x0000000000020000n;
 
 const BATCH = 100;
 const API_TIMEOUT = 15_000; // CloudCashbox may take time for myDATA round-trip
@@ -580,11 +616,191 @@ export class MyDataService {
         cbReceiptMoment: order.updatedAt ?? new Date(),
         status: 'PENDING',
         sandbox: this.isSandbox,
+        documentType: 'SALE',
       },
     });
 
     this.logger.debug(
       `MyDataReceipt created for order ${order.orderNumber} (pending submission)`,
+    );
+  }
+
+  /**
+   * Fiscal record for a refund of an already paid sale.
+   *
+   * myDATA never edits a document, so a refund is a receipt of its own, flagged
+   * IsReturn/IsRefund and referencing the sale it reverses. Writing it in the
+   * same transaction as the money movement gives the same guarantee as the sale:
+   * money may not leave without a fiscal record.
+   *
+   * Full refund (everything comes back): the receipt-level flag marks it and
+   * every original line is inverted. Partial refund: only the lines that came
+   * back carry the item flag — that is what separates it from a full refund.
+   * Source: general/cash-register-integration/refunds-and-voids, Table 3.
+   */
+  async recordRefund(
+    tx: Tx,
+    orderId: string,
+    refundId: string,
+    refundAmount: number,
+    method: string,
+    returnedItems?: { orderItemId: string; quantity: number }[],
+  ): Promise<void> {
+    if (!this.isEnabled) return;
+
+    const r2 = (v: number) => Math.round((v + Number.EPSILON) * 100) / 100;
+
+    // Idempotent: refundId is unique on the receipt, so a replayed refund can
+    // never fiscalise twice.
+    const existing = await tx.myDataReceipt.findFirst({
+      where: { refundId },
+      select: { id: true },
+    });
+    if (existing) return;
+
+    // Without a sale record there is nothing to correct — myDATA was off when
+    // the sale happened, and a refund document would reference a document the
+    // authority never saw.
+    const sale = await tx.myDataReceipt.findFirst({
+      where: {
+        orderId,
+        documentType: 'SALE',
+        status: { in: ['SUBMITTED', 'PENDING'] },
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (!sale) {
+      this.logger.warn(
+        `Refund ${refundId}: no myDATA sale receipt for order ${orderId} — no fiscal record written`,
+      );
+      return;
+    }
+
+    const order = await tx.order.findUniqueOrThrow({
+      where: { id: orderId },
+      include: { items: true },
+    });
+
+    const saleTotal = Number(order.totalAmount);
+    const isFullRefund = refundAmount >= saleTotal - 0.005;
+    const grossSum = order.items.reduce((s, i) => s + Number(i.lineTotal), 0);
+
+    const returnedByItem = new Map<string, number>();
+    for (const ret of returnedItems ?? []) {
+      returnedByItem.set(
+        ret.orderItemId,
+        (returnedByItem.get(ret.orderItemId) ?? 0) + ret.quantity,
+      );
+    }
+
+    const chargeItems: FtChargeItem[] = [];
+    let position = 0;
+
+    for (const item of order.items) {
+      const vatRate = Number(item.taxRateSnapshot);
+      const itemCase = this.chargeItemCase(vatRate);
+      // A line on an unknown Greek rate cannot be fiscalised; the sale already
+      // logged that as bad master data, so skip it instead of inventing a case.
+      if (itemCase === undefined) continue;
+
+      let quantity: number;
+      let amount: number;
+
+      if (isFullRefund) {
+        quantity = Number(item.quantity ?? 1);
+        amount = -Math.abs(Number(item.lineTotal));
+      } else if (returnedByItem.size > 0) {
+        // Only the units the staff member said came back.
+        const qtyBack = returnedByItem.get(item.id) ?? 0;
+        if (qtyBack <= 0) continue;
+        const unitPrice =
+          Number(item.lineTotal) / Math.max(1, Number(item.quantity ?? 1));
+        quantity = qtyBack;
+        amount = -(unitPrice * qtyBack);
+      } else {
+        // Money-only partial refund: spread the amount over the original lines
+        // by value, so every VAT bucket is reversed with the tax it carried.
+        const share =
+          grossSum > 0 ? (refundAmount * Number(item.lineTotal)) / grossSum : 0;
+        if (r2(share) <= 0) continue;
+        quantity = Number(item.quantity ?? 1);
+        amount = -share;
+      }
+
+      position += 1;
+      chargeItems.push({
+        Quantity: quantity,
+        Description: (item.nameSnapshot ?? `Item ${position}`).slice(0, 200),
+        Amount: r2(amount),
+        VATRate: vatRate,
+        Position: position,
+        ftChargeItemCase: itemCase | ITEM_RETURN_FLAG,
+      });
+    }
+
+    if (chargeItems.length === 0) {
+      this.logger.warn(
+        `Refund ${refundId}: no charge lines could be built — no fiscal record written`,
+      );
+      return;
+    }
+
+    // v2 requires sum(chargeItems) == sum(payItems); the refunded money is the
+    // pay item, flagged as a return because it was already collected once.
+    const chargeSum = r2(chargeItems.reduce((s, ci) => s + ci.Amount, 0));
+    const payItems: FtPayItem[] = [
+      {
+        Description: String(method),
+        Amount: chargeSum,
+        Position: 1,
+        ftPayItemCase:
+          (method === 'CASH' ? PAY_CASH : PAY_CARD) | ITEM_RETURN_FLAG,
+      },
+    ];
+
+    const vatBuckets = new Map<number, number>();
+    for (const ci of chargeItems) {
+      vatBuckets.set(ci.VATRate, (vatBuckets.get(ci.VATRate) ?? 0) + ci.Amount);
+    }
+    const amounts: FtAmount[] = [...vatBuckets.entries()].map(([rate, amt]) => ({
+      ftAmount: amt,
+      ftTaxCR: rate,
+    }));
+
+    await tx.myDataReceipt.create({
+      data: {
+        orderId,
+        orderNumber: `REFUND-${order.orderNumber}`,
+        branchId: order.branchId,
+        // A full refund carries the receipt-level flag; a partial one leaves it
+        // off and relies on the item flags (see Table 3 of the GR docs).
+        receiptCase: isFullRefund
+          ? RECEIPT_CASE_REFUND
+          : RECEIPT_CASE_POS_RECEIPT,
+        amounts: JSON.stringify(amounts),
+        chargeItems: JSON.stringify(
+          chargeItems.map(ci => ({
+            ...ci,
+            ftChargeItemCase: ci.ftChargeItemCase?.toString(),
+          })),
+        ),
+        payItems: JSON.stringify(
+          payItems.map(pi => ({ ...pi, ftPayItemCase: pi.ftPayItemCase?.toString() })),
+        ),
+        tableArea: null,
+        totalAmount: chargeSum,
+        cbReceiptMoment: new Date(),
+        status: 'PENDING',
+        sandbox: this.isSandbox,
+        documentType: 'REFUND',
+        refundId,
+        originalReceiptId: sale.id,
+      },
+    });
+
+    this.logger.debug(
+      `MyDataReceipt created for refund of ${order.orderNumber} ` +
+        `(${isFullRefund ? 'full' : 'partial'}, pending submission)`,
     );
   }
 
@@ -690,6 +906,8 @@ export class MyDataService {
     tableArea: string | null;
     totalAmount: Prisma.Decimal;
     cbReceiptMoment: Date;
+    documentType?: string;
+    originalReceiptId?: string | null;
   }): Promise<ReceiptMyData> {
     const amounts: FtAmount[] = JSON.parse(receipt.amounts);
 
@@ -794,6 +1012,27 @@ export class MyDataService {
 
     if (receipt.tableArea) {
       body.cbArea = receipt.tableArea.slice(0, 50);
+    }
+
+    // A refund references the sale it reverses. Without the reference myDATA
+    // records an unrelated return instead of a correction of that document, and
+    // the original sale stays unmatched in the fiscal records.
+    if (receipt.documentType === 'REFUND' && receipt.originalReceiptId) {
+      const original = await this.prisma.myDataReceipt.findUnique({
+        where: { id: receipt.originalReceiptId },
+        select: { orderNumber: true, mark: true },
+      });
+      if (original?.orderNumber) {
+        body.cbPreviousReceiptReference = original.orderNumber;
+      }
+      if (original?.mark) {
+        // The sale may still lack a MARK when both receipts are queued in the
+        // same batch; then only the local reference travels and the Middleware
+        // resolves it from its own journal.
+        body.ftReceiptCaseData = {
+          GR: { PreviousReceiptReference: { invoiceMark: original.mark } },
+        };
+      }
     }
 
     // Serialize BigInt Int64 cases as raw JSON numbers.

@@ -3791,6 +3791,14 @@ model MyDataReceipt {
   // Cancellation
   cancelMark        String?
   cancelledAt       DateTime?
+  // What business case this row represents. A sale and its refund are two
+  // receipts, never one edited row: myDATA data cannot be corrected in place.
+  documentType      MyDataDocumentType @default(SALE)
+  // Set on a REFUND row: which Refund caused it. Also the idempotency key, so
+  // a retried refund cannot produce a second fiscal receipt.
+  refundId          String?  @unique
+  // Set on a REFUND row: the sale receipt it reverses, for cbPreviousReceiptReference.
+  originalReceiptId String?
   // Retry tracking (sendPending increments on failure, moves to FAILED after MAX_RETRIES)
   retryCount        Int      @default(0)
   lastError         String?
@@ -3805,4 +3813,11 @@ enum MyDataReceiptStatus {
   SUBMITTED   // Successfully submitted, MARK received
   FAILED      // Submission failed permanently (after max retries)
   CANCELLED   // Cancelled via CancelInvoice at myDATA
+}
+
+// The business case behind a fiscal row. myDATA never edits a document, so a
+// correction is always a new document of its own type.
+enum MyDataDocumentType {
+  SALE    // POS receipt (myDATA 11.1) — the original sale
+  REFUND  // Return/refund of a paid sale (IsReturn/IsRefund, myDATA 11.4)
 }

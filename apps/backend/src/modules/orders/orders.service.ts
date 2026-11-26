@@ -2235,6 +2235,17 @@ export class OrdersService {
         });
       }
       await this.verifactu.recordRefund(tx, orderId, created.id, dto.amount);
+      // Greece myDATA: same guarantee as the sale — money may not leave without
+      // a fiscal record. A refund of a paid sale is a new document flagged
+      // IsReturn/IsRefund; it references the original sale receipt.
+      await this.mydata.recordRefund(
+        tx,
+        orderId,
+        created.id,
+        dto.amount,
+        dto.method,
+        dto.returnedItems,
+      );
       await this.reverseRefundPoints(tx, {
         branchId,
         orderId,
